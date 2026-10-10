@@ -2,6 +2,14 @@
 
 macOS 菜单栏的 AI 编程工具用量监控。常驻菜单栏，按平台展示额度余量，统计本机产生的 token 用量与费用。
 
+## 截图
+
+以下均为 `codeusagemonit --demo` 演示数据的界面（不含任何真实账户信息）。
+
+| 完整面板 · 概览 | 平台详情 · Codex | 自定义平台 · 示例网关 | Edge dock 窄条 |
+| --- | --- | --- | --- |
+| ![完整面板概览：Token 大数字、每日用量与各平台卡片](docs/screenshots/overview.png) | ![平台详情页：额度窗口、本机用量与模型构成](docs/screenshots/platform-detail.png) | ![自定义 HTTP 平台：每日额度与可用余额](docs/screenshots/custom-platform.png) | ![edge dock：贴边竖排，弧形进度显示各平台剩余额度](docs/screenshots/edge-dock.png) |
+
 ## 功能
 
 - **平台额度监控**：内置 13 个平台（Codex / Claude / Cursor / Antigravity / DeepSeek / Grok / Copilot / Kimi / OpenCode / ZCode / Pi / MiMo / StepFun），新装默认启用其中 6 个，其余在设置里按需开启；也支持自定义 HTTP 平台。
