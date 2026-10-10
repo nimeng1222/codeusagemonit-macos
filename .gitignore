@@ -1,0 +1,13 @@
+# build artifacts
+bin/
+obj/
+dist/
+
+# test/verification outputs (may contain real usage data & screenshots)
+verification/
+verification-logs/
+
+# tooling & OS
+.mimosa/
+.DS_Store
+*.user

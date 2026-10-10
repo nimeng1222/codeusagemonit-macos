@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CodeUsageMonit.Cli/CodeUsageMonit.Cli.csproj" />
+    <Project Path="src/CodeUsageMonit.Core/CodeUsageMonit.Core.csproj" />
+    <Project Path="src/CodeUsageMonit.Desktop/CodeUsageMonit.Desktop.csproj" />
+  </Folder>
+</Solution>

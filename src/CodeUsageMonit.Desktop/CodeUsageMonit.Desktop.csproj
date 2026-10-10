@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- 与 Core 一致：代码未使用可空引用类型标注。 -->
+    <Nullable>disable</Nullable>
+    <!-- 本机只装了 .NET 10 运行时；net8.0 目标允许滚动到更高主版本运行。 -->
+    <RollForward>LatestMajor</RollForward>
+    <AssemblyName>codeusagemonit</AssemblyName>
+    <Version>1.0.0</Version>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.3" />
+    <PackageReference Include="AvaloniaUI.DiagnosticsSupport" Version="2.2.3">
+      <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
+      <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeUsageMonit.Core\CodeUsageMonit.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Panel 的图标与内置价目表放在 exe 旁。 -->
+    <None Include="Assets\pricing.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\icons\**\*.svg" CopyToOutputDirectory="PreserveNewest" Link="icons\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

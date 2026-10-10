@@ -1,0 +1,243 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="CodeUsageMonit.Desktop.App"
+             RequestedThemeVariant="Dark">
+  <!-- Panel.xaml 的 Window.Resources 移到这里（Panel.xaml:8-227）：样式注册在应用级，
+       悬停提示与菜单所在的弹出层、设置窗口与面板共用同一套控件样式。FluentTheme 仅兜底
+       个别未自绘的控件；下面每一条样式与其后的类选择器一一对应。 -->
+
+  <Application.Resources>
+    <!-- Palette: neutral ink on smoked glass; one cool accent; provider colours only in data. -->
+    <SolidColorBrush x:Key="Ink">#F2F3F5</SolidColorBrush>
+    <SolidColorBrush x:Key="InkDim">#A7ADB7</SolidColorBrush>
+    <SolidColorBrush x:Key="InkFaint">#7D838D</SolidColorBrush>
+    <SolidColorBrush x:Key="Accent">#5CC8E0</SolidColorBrush>
+    <SolidColorBrush x:Key="Hairline">#14FFFFFF</SolidColorBrush>
+  </Application.Resources>
+
+  <Application.Styles>
+    <FluentTheme />
+
+    <!-- ── Default button: quiet text button used for links and inline actions (Panel.xaml:17) ── -->
+    <Style Selector="Button">
+      <Setter Property="Foreground">#D9DCE1</Setter>
+      <Setter Property="Background">Transparent</Setter>
+      <Setter Property="BorderThickness">0</Setter>
+      <Setter Property="Padding">10,6</Setter>
+      <Setter Property="FontSize">11.5</Setter>
+      <Setter Property="Cursor">Hand</Setter>
+      <Setter Property="HorizontalContentAlignment">Center</Setter>
+      <Setter Property="VerticalContentAlignment">Center</Setter>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Grid>
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7" />
+            <Border Name="Hover" Background="#FFFFFF" Opacity="0" CornerRadius="7" />
+            <ContentPresenter Margin="{TemplateBinding Padding}" Content="{TemplateBinding Content}" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center" />
+          </Grid>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="Button:pointerover /template/ Border#Hover"><Setter Property="Opacity" Value="0.07" /></Style>
+    <Style Selector="Button:pressed /template/ Border#Hover"><Setter Property="Opacity" Value="0.03" /></Style>
+    <Style Selector="Button:disabled"><Setter Property="Opacity" Value="0.4" /></Style>
+
+    <!-- IconButton (Panel.xaml:35)：图形按钮；内容是代码给出的 Geometry，不再是图标字体。 -->
+    <Style Selector="Button.icon-button">
+      <Setter Property="Width">30</Setter>
+      <Setter Property="Height">30</Setter>
+      <Setter Property="Padding">0</Setter>
+      <Setter Property="HorizontalContentAlignment">Center</Setter>
+      <Setter Property="VerticalContentAlignment">Center</Setter>
+      <Setter Property="Foreground">#A7ADB7</Setter>
+    </Style>
+
+    <Style Selector="Button.link-button">
+      <Setter Property="Foreground">#A7ADB7</Setter>
+      <Setter Property="Padding">6,4</Setter>
+      <Setter Property="FontSize">11</Setter>
+    </Style>
+
+    <!-- 红绿灯（MainWindow 标题区左侧）：13px 纯色圆点，悬停时才显示自绘字形；
+          模板自带的白色悬停高亮对圆形太吵，这里压为 0。 -->
+    <Style Selector="Button.traffic">
+      <Setter Property="Width">17</Setter>
+      <Setter Property="Height">17</Setter>
+      <Setter Property="Padding">0</Setter>
+    </Style>
+    <Style Selector="Button.traffic:pointerover /template/ Border#Hover"><Setter Property="Opacity" Value="0" /></Style>
+    <Style Selector="Button.traffic Path.traffic-glyph"><Setter Property="IsVisible" Value="False" /></Style>
+    <Style Selector="Button.traffic:pointerover Path.traffic-glyph"><Setter Property="IsVisible" Value="True" /></Style>
+
+    <Style Selector="Button.secondary">
+      <Setter Property="Background">#12FFFFFF</Setter>
+      <Setter Property="BorderBrush">#1CFFFFFF</Setter>
+      <Setter Property="BorderThickness">1</Setter>
+      <Setter Property="Foreground">#E6E8EB</Setter>
+      <Setter Property="Padding">12,6</Setter>
+    </Style>
+
+    <Style Selector="Button.primary">
+      <Setter Property="Background">#E9EBEE</Setter>
+      <Setter Property="Foreground">#15171B</Setter>
+      <Setter Property="FontWeight">SemiBold</Setter>
+      <Setter Property="Padding">16,6</Setter>
+    </Style>
+
+    <!-- Provider strip tab: background is set by code (selected), hover is an overlay (Panel.xaml:53). -->
+    <Style Selector="Button.tab-button">
+      <Setter Property="Padding">2,7,2,6</Setter>
+      <Setter Property="HorizontalContentAlignment">Center</Setter>
+    </Style>
+
+    <!-- ── Toggle switch used by settings (Panel.xaml:58) ── -->
+    <Style Selector="CheckBox.switch">
+      <Setter Property="Foreground">#F2F3F5</Setter>
+      <Setter Property="Cursor">Hand</Setter>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Grid Background="Transparent" ColumnDefinitions="*,Auto">
+            <ContentPresenter Content="{TemplateBinding Content}" VerticalAlignment="Center" Margin="0,0,14,0" />
+            <Border Name="Track" Grid.Column="1" Width="36" Height="20" CornerRadius="10" Background="#1FFFFFFF" BorderBrush="#2BFFFFFF" BorderThickness="1" VerticalAlignment="Center">
+              <Ellipse Name="Knob" Width="12" Height="12" Fill="#C4C8CE" HorizontalAlignment="Left" Margin="3,0" VerticalAlignment="Center" />
+            </Border>
+          </Grid>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="CheckBox.switch:pointerover /template/ Border#Track"><Setter Property="BorderBrush">#45FFFFFF</Setter></Style>
+    <Style Selector="CheckBox.switch:checked /template/ Border#Track">
+      <Setter Property="Background">#5CC8E0</Setter>
+      <Setter Property="BorderBrush">#5CC8E0</Setter>
+    </Style>
+    <Style Selector="CheckBox.switch:checked /template/ Ellipse#Knob">
+      <Setter Property="HorizontalAlignment">Right</Setter>
+      <Setter Property="Fill">#0E1417</Setter>
+      <Setter Property="Width">14</Setter>
+      <Setter Property="Height">14</Setter>
+    </Style>
+    <Style Selector="CheckBox.switch:disabled"><Setter Property="Opacity" Value="0.4" /></Style>
+
+    <!-- ── Pill toggle for provider selection (Panel.xaml:81) ── -->
+    <Style Selector="CheckBox.chip">
+      <Setter Property="Foreground">#A7ADB7</Setter>
+      <Setter Property="Cursor">Hand</Setter>
+      <Setter Property="FontSize">11.5</Setter>
+      <Setter Property="Margin">0,0,6,6</Setter>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Border Name="Pill" CornerRadius="15" Padding="10,5,12,5" Background="Transparent" BorderBrush="#24FFFFFF" BorderThickness="1">
+            <ContentPresenter Content="{TemplateBinding Content}" VerticalAlignment="Center" />
+          </Border>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="CheckBox.chip:pointerover /template/ Border#Pill"><Setter Property="BorderBrush">#40FFFFFF</Setter></Style>
+    <Style Selector="CheckBox.chip:checked /template/ Border#Pill">
+      <Setter Property="Background">#1A5CC8E0</Setter>
+      <Setter Property="BorderBrush">#995CC8E0</Setter>
+    </Style>
+    <Style Selector="CheckBox.chip:checked"><Setter Property="Foreground">#F2F3F5</Setter></Style>
+    <Style Selector="CheckBox.chip:disabled"><Setter Property="Opacity" Value="0.4" /></Style>
+
+    <!-- ── Segment of a segmented control (Panel.xaml:99) ── -->
+    <Style Selector="RadioButton.segment">
+      <Setter Property="Foreground">#A7ADB7</Setter>
+      <Setter Property="Cursor">Hand</Setter>
+      <Setter Property="FontSize">11.5</Setter>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Border Name="Seg" CornerRadius="6" Padding="10,5" Background="Transparent">
+            <ContentPresenter Content="{TemplateBinding Content}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+          </Border>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="RadioButton.segment:pointerover /template/ Border#Seg"><Setter Property="Background">#0DFFFFFF</Setter></Style>
+    <Style Selector="RadioButton.segment:checked /template/ Border#Seg"><Setter Property="Background">#26FFFFFF</Setter></Style>
+    <Style Selector="RadioButton.segment:checked"><Setter Property="Foreground">#F2F3F5</Setter></Style>
+
+    <!-- ── TextBox（含密码框 KeyBox：Avalonia 无独立 PasswordBox，用 TextBox.PasswordChar）──
+         只覆盖属性，模板沿用 Fluent 的 PART_BorderElement。 -->
+    <Style Selector="TextBox">
+      <Setter Property="Foreground">#F2F3F5</Setter>
+      <Setter Property="CaretBrush">#F2F3F5</Setter>
+      <Setter Property="SelectionBrush">#5CC8E0</Setter>
+      <Setter Property="FontSize">12</Setter>
+      <Setter Property="Padding">10,4</Setter>
+      <Setter Property="MinHeight">32</Setter>
+      <Setter Property="Background">#0FFFFFFF</Setter>
+      <Setter Property="BorderBrush">#1FFFFFFF</Setter>
+      <Setter Property="BorderThickness">1</Setter>
+      <Setter Property="CornerRadius">7</Setter>
+      <Setter Property="VerticalContentAlignment">Center</Setter>
+    </Style>
+    <Style Selector="TextBox:pointerover /template/ Border#PART_BorderElement">
+      <Setter Property="Background">#0FFFFFFF</Setter>
+      <Setter Property="BorderBrush">#33FFFFFF</Setter>
+    </Style>
+    <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+      <Setter Property="Background">#14FFFFFF</Setter>
+      <Setter Property="BorderBrush">#5CC8E0</Setter>
+    </Style>
+    <Style Selector="TextBox:disabled"><Setter Property="Opacity" Value="0.45" /></Style>
+
+    <!-- ── 6px thin scrollbar (Panel.xaml:169-183) ──
+         Background 必须绑在 PART_ContentPresenter 上（Fluent 官方模板同款）：滚轮由
+         ScrollContentPresenter.OnPointerWheelChanged 处理、要求命中点在 presenter 子树内。
+         不绑的话 presenter 默认 null 背景、空白处（卡片缝隙、视口空白）命中测试穿透到
+         Surface Border，滚轮与按住拖动滚动全部失效（滚轮盲区修复）。透明画刷参与命中
+         测试但不着色，外观不变。绑在外层 Grid 上无效——Grid 不在 presenter 子树内，
+         命中了也滚不动。Padding 由 presenter.Margin 承担（见下），padding 边条不在此内。 -->
+    <Style Selector="ScrollViewer">
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Grid ColumnDefinitions="*,6">
+            <ScrollContentPresenter Name="PART_ContentPresenter" Background="{TemplateBinding Background}" Margin="{TemplateBinding Padding}" />
+            <ScrollBar Name="PART_VerticalScrollBar" Grid.Column="1" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Stretch" />
+          </Grid>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="ScrollBar">
+      <Setter Property="Background">Transparent</Setter>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Panel Background="Transparent">
+            <Track Name="PART_Track" Orientation="{TemplateBinding Orientation}" Minimum="{TemplateBinding Minimum}" Maximum="{TemplateBinding Maximum}" Value="{TemplateBinding Value}" ViewportSize="{TemplateBinding ViewportSize}">
+              <Track.Thumb>
+                <Thumb>
+                  <Thumb.Template>
+                    <ControlTemplate>
+                      <Border Name="Bar" Background="#2EFFFFFF" CornerRadius="2" Margin="1.5,2" />
+                    </ControlTemplate>
+                  </Thumb.Template>
+                </Thumb>
+              </Track.Thumb>
+            </Track>
+          </Panel>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+    <Style Selector="ScrollBar:vertical"><Setter Property="Width">6</Setter></Style>
+    <Style Selector="ScrollBar:horizontal"><Setter Property="Height">6</Setter></Style>
+    <Style Selector="ScrollBar /template/ Border#Bar:pointerover"><Setter Property="Background">#55FFFFFF</Setter></Style>
+
+    <!-- ── Dark tooltip (Panel.xaml:218) ── -->
+    <Style Selector="ToolTip">
+      <Setter Property="FontSize">11.5</Setter>
+      <Setter Property="Foreground">#E6E8EB</Setter>
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Border Background="#F21E2126" BorderBrush="#33FFFFFF" BorderThickness="1" CornerRadius="7" Padding="10,7" MaxWidth="290">
+            <ContentPresenter Content="{TemplateBinding Content}">
+              <ContentPresenter.Styles>
+                <Style Selector="TextBlock"><Setter Property="TextWrapping" Value="Wrap" /><Setter Property="LineHeight" Value="17" /></Style>
+              </ContentPresenter.Styles>
+            </ContentPresenter>
+          </Border>
+        </ControlTemplate>
+      </Setter>
+    </Style>
+  </Application.Styles>
+</Application>

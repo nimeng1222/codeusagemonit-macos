@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeUsageMonit.Core\CodeUsageMonit.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 与 Core 一致：代码未使用可空引用类型标注。 -->
+    <Nullable>disable</Nullable>
+    <!-- 本机只装了 .NET 10 运行时；net8.0 目标允许滚动到更高主版本运行。 -->
+    <RollForward>LatestMajor</RollForward>
+    <AssemblyName>codeusage</AssemblyName>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+</Project>

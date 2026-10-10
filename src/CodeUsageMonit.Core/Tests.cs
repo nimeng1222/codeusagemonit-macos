@@ -1,0 +1,2625 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+
+namespace CodeUsageMonit {
+    public static class SelfTests {
+        // Desktop 侧补充用例（Program.cs 在 --self-test 时装配）：Core 自测程序集不能反向
+        // 引用 Desktop，由入口把「名称 + 断言」清单挂进来，与 Core 用例同一张清单计数并
+        // 写入 tests.json。清单里不得出现真实凭据，也不得发起网络请求。
+        public static Func<IEnumerable<KeyValuePair<string, Action>>> DesktopTestSource;
+        public static int Run() {
+            // 自测进程不写真实数据目录：归档默认关（合成索引不得泄漏进真实归档），
+            // 归档专项用例在各自的临时数据目录里临时打开。Phase 0/1 的扫描类用例因此
+            // 保持原有纯内存语义。
+            UsageArchive.Enabled = false;
+            var passed = new List<string>(); var failed = new List<string>();
+            Action<string, Action> test = (name, check) => { try { check(); passed.Add(name); } catch (Exception e) { failed.Add(name + ": " + e.Message); } };
+            test("Codex weekly-only response does not invent a 5h window", () => {
+                var s = Parsers.Codex(J.Parse("{\"rate_limit\":{\"primary_window\":{\"used_percent\":38,\"limit_window_seconds\":604800,\"reset_at\":1900000000},\"secondary_window\":null}}"));
+                Require(s.Quotas.Count == 1 && s.Quotas[0].Label == "每周" && s.Quotas[0].Remaining == 62);
+            });
+            test("Window classification uses duration, not primary/secondary position", () => {
+                var s = Parsers.Codex(J.Parse("{\"rate_limit\":{\"primary_window\":{\"used_percent\":10,\"limit_window_seconds\":604800},\"secondary_window\":{\"used_percent\":70,\"limit_window_seconds\":18000}}}"));
+                Require(s.Quotas[0].Label == "每周" && s.Quotas[1].Label == "5 小时" && s.Quotas[1].Remaining == 30);
+            });
+            test("Absent utilization stays unknown instead of becoming zero", () => {
+                Require(Parsers.Claude(J.Parse("{\"five_hour\":{\"resets_at\":null},\"seven_day\":null}")).Quotas.Count == 0);
+                Require(Parsers.Codex(J.Parse("{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":18000}}}")).Quotas.Count == 0);
+            });
+            test("Explicit zero usage is valid data", () => {
+                var s = Parsers.Claude(J.Parse("{\"five_hour\":{\"utilization\":0},\"seven_day\":{\"utilization\":3}}"));
+                Require(s.Quotas.Count == 2 && s.Quotas[0].Remaining == 100 && s.Quotas[1].Remaining == 97);
+            });
+            test("Malformed optional Codex limits do not discard primary usage", () => {
+                var s = Parsers.Codex(J.Parse("{\"rate_limit\":{\"primary_window\":{\"used_percent\":25,\"limit_window_seconds\":18000}},\"additional_rate_limits\":[null,{}, {\"limit_name\":\"test-model\",\"rate_limit\":{\"primary_window\":{\"used_percent\":50,\"limit_window_seconds\":604800}}}]}"));
+                Require(s.Quotas.Count == 2 && s.Quotas[0].Remaining == 75);
+            });
+            test("Cursor total, Auto and API retain separate metrics", () => {
+                var s = Parsers.Cursor(J.Parse("{\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20,\"autoPercentUsed\":5,\"apiPercentUsed\":99}}}"));
+                Require(s.Quotas.Count == 3 && s.Quotas[0].Remaining == 80 && s.Quotas[1].Remaining == 95 && s.Quotas[2].Remaining == 1);
+            });
+            test("Cursor cycle duration is used only when both API boundaries exist", () => {
+                var state = Parsers.Cursor(J.Parse("{\"membershipType\":\"pro\",\"billingCycleStart\":\"2026-01-01T00:00:00Z\",\"billingCycleEnd\":\"2026-01-31T00:00:00Z\",\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20}}}"));
+                Require(state.Plan == "Cursor Pro" && state.Quotas[0].WindowSeconds == 2592000);
+                var missing = Parsers.Cursor(J.Parse("{\"billingCycleEnd\":\"2026-01-31T00:00:00Z\",\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20}}}")); Require(missing.Quotas[0].WindowSeconds == 0);
+            });
+            test("Cursor Grok Bot weekly quota is appended after the plan meters", () => {
+                var s = Parsers.Cursor(J.Parse("{\"membershipType\":\"pro\",\"billingCycleStart\":\"2026-09-02T03:15:00.000Z\",\"billingCycleEnd\":\"2026-10-02T03:15:00.000Z\",\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20.38,\"autoPercentUsed\":12.53,\"apiPercentUsed\":98.89}}}"));
+                Parsers.CursorGrokBot(s, J.Parse("{\"currentPeriodStart\":\"2026-09-24T03:13:20.873Z\",\"nextResetTimestampUtc\":\"2026-10-01T03:13:20.873Z\",\"usagePercent\":69.163729,\"hasNonZeroIncludedLimit\":true,\"hasAvailableUsage\":true}"));
+                Require(s.Quotas.Count == 4 && s.Quotas[0].Label == "套餐总量" && s.Quotas[1].Label == "Auto" && s.Quotas[2].Label == "API / 手动模型" && s.Quotas[3].Label == Parsers.CursorGrokLabel);
+                Require(Math.Abs(s.Quotas[3].Used - 69.163729) < 1e-4 && Math.Abs(s.Quotas[3].Remaining - 30.836271) < 1e-4);
+                Require(s.Quotas[3].ResetUtc.StartsWith("2026-10-01T03:13:20") && Math.Abs(s.Quotas[3].WindowSeconds - 604800) < 1);
+                Require(UsageDetails.Primary(s).Label == "套餐总量" && UsageDetails.MainWindow(s).Label == "套餐总量");
+                var noCycle = Parsers.Cursor(J.Parse("{\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20,\"autoPercentUsed\":5,\"apiPercentUsed\":99}}}"));
+                Parsers.CursorGrokBot(noCycle, J.Parse("{\"usagePercent\":69.163729,\"hasNonZeroIncludedLimit\":true,\"currentPeriodStart\":\"2026-09-24T03:13:20.873Z\",\"nextResetTimestampUtc\":\"2026-10-01T03:13:20.873Z\"}"));
+                Require(UsageDetails.Primary(noCycle).Label == "套餐总量" && UsageDetails.MainWindow(noCycle) == null);
+            });
+            test("Cursor Grok Bot with a zero included limit adds no quota", () => {
+                var s = Parsers.Cursor(J.Parse("{\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20,\"autoPercentUsed\":5,\"apiPercentUsed\":99}}}"));
+                Parsers.CursorGrokBot(s, J.Parse("{\"usagePercent\":69,\"hasNonZeroIncludedLimit\":false,\"hasAvailableUsage\":false,\"nextResetTimestampUtc\":\"2026-10-01T03:13:20.873Z\",\"currentPeriodStart\":\"2026-09-24T03:13:20.873Z\"}"));
+                Require(s.Quotas.Count == 3 && s.Quotas.All(q => q.Label != Parsers.CursorGrokLabel) && s.Quotas[0].Remaining == 80);
+            });
+            test("Cursor Grok Bot missing fields add no quota", () => {
+                var s = Parsers.Cursor(J.Parse("{\"individualUsage\":{\"plan\":{\"totalPercentUsed\":20}}}"));
+                Parsers.CursorGrokBot(s, null);
+                Parsers.CursorGrokBot(s, J.Parse("{}"));
+                Parsers.CursorGrokBot(s, J.Parse("{\"hasNonZeroIncludedLimit\":true,\"nextResetTimestampUtc\":\"2026-10-01T03:13:20.873Z\"}"));
+                Parsers.CursorGrokBot(s, J.Parse("{\"usagePercent\":69,\"nextResetTimestampUtc\":\"2026-10-01T03:13:20.873Z\"}"));
+                Parsers.CursorGrokBot(s, J.Parse("{\"hasNonZeroIncludedLimit\":true,\"usagePercent\":\"nope\"}"));
+                Require(s.Quotas.Count == 1 && s.Quotas[0].Label == "套餐总量" && s.Quotas[0].Remaining == 80);
+            });
+            test("DeepSeek currencies are never summed or treated as percentages", () => {
+                var s = Parsers.DeepSeek(J.Parse("{\"balance_infos\":[{\"currency\":\"CNY\",\"total_balance\":\"12.34\"},{\"currency\":\"USD\",\"total_balance\":\"2.50\"}]}"));
+                Require(s.Quotas.Count == 0 && s.Balances.Count == 2 && s.Balances[0].Amount == 12.34);
+            });
+            test("Antigravity fractions map correctly and null buckets stay absent", () => {
+                var s = Parsers.Antigravity(J.Parse("{\"groups\":[{\"displayName\":\"Gemini\",\"buckets\":[{\"window\":\"5h\",\"remainingFraction\":0.7},{\"window\":\"weekly\",\"remainingFraction\":null}]}]}"));
+                Require(s.Quotas.Count == 1 && Math.Abs(s.Quotas[0].Remaining - 70) < 0.0001);
+            });
+            test("Antigravity model fallback preserves each model's quota", () => {
+                var s = Parsers.Antigravity(J.Parse("{\"models\":{\"model-a\":{\"quotaInfo\":{\"remainingFraction\":0}},\"model-b\":{\"quotaInfo\":{\"remainingFraction\":1}}}}"));
+                Require(s.Quotas.Count == 2 && s.Quotas.Sum(q => q.Remaining) == 100);
+            });
+            test("Grok zero spend is a full allowance, not missing data", () => {
+                var s = Parsers.Grok(J.Parse("{\"config\":{\"creditUsagePercent\":0}}")); Require(s.Quotas.Count == 1 && s.Quotas[0].Remaining == 100);
+            });
+            test("Grok product shares split the one allowance and are not quotas", () => {
+                var s = Parsers.Grok(J.Parse("{\"config\":{\"creditUsagePercent\":63,\"productUsage\":[{\"product\":\"GROK_BUILD\",\"usagePercent\":55},{\"product\":\"CHAT\",\"usagePercent\":8}]}}"));
+                Require(s.Quotas.Count == 1 && s.Quotas[0].Remaining == 37 && s.ProductUsage.Count == 2 && s.ProductUsage[0].DisplayName == "Build" && s.ProductUsage[1].DisplayName == "Chat");
+                var old = new ProviderState { Id = "grok" }; Parsers.Add(old, "当前账期", 63, null); Parsers.Add(old, "Build 占比", 55, null);
+                Require(Parsers.Normalize(old).Quotas.Count == 1 && old.Quotas[0].Label == "当前账期" && old.Quotas[0].Remaining == 37 && old.ProductUsage.Count == 0);
+            });
+            GrokTests.Run(test);
+            CloudProviderTests.Run(test);
+            PlanAttributionTests.Run(test);
+            test("Percentages are bounded and nonnumeric values ignored", () => {
+                var s = new ProviderState(); Parsers.Add(s, "one", -10, null); Parsers.Add(s, "two", 150, null); Parsers.Add(s, "bad", "NaN", null); Require(s.Quotas.Count == 2 && s.Quotas[0].Remaining == 100 && s.Quotas[1].Remaining == 0);
+            });
+            test("Daily history groups hourly buckets by local day and model", () => {
+                var idx = new LogIndex(); idx.Files.Add(new LogFile { Hours = { { "2026010110||m1", new Bucket { I = 100, C = 900, O = 10, R = 1, D = 2 } }, { "2026010118||m2", new Bucket { I = 50, O = 5, R = 1, D = 1 } } } });
+                // 10:00Z is 18:00 on Jan 1 in UTC+8; 18:00Z is 02:00 on Jan 2.
+                var h = HistoryService.FromIndexes(new Dictionary<string, LogIndex> { { "codex", idx } }, TimeZones.Find("China Standard Time"), new DateTime(2026, 1, 2), 30);
+                Require(h.Days.Count == 2 && h.Days[0].Day == "2026-01-01" && h.Days[0].Tokens == 1010 && h.Days[0].CachedTokens == 900 && h.Days[0].Cost == 2 && h.Days[1].Day == "2026-01-02" && h.Days[1].Models[0].Model == "m2" && h.Engine == HistoryService.Engine);
+            });
+            test("Model totals share the daily scope and count independent reasoning tokens", () => {
+                // 复现 review #7：I=100,O=50,X=200（OpenCode 把独立推理放进 X）曾得到
+                // dailyTokens=350、modelTokens=150；模型汇总必须与每日同一口径。
+                var idx = new LogIndex(); idx.Files.Add(new LogFile { Hours = { { "2026010110||m1", new Bucket { I = 100, O = 50, X = 200, R = 1, D = 2 } } } });
+                var h = HistoryService.FromIndexes(new Dictionary<string, LogIndex> { { "codex", idx } }, TimeZoneInfo.Utc, new DateTime(2026, 1, 1), 30);
+                Require(h.Days.Count == 1 && Math.Abs(h.Days[0].Tokens - 350) < 1e-9 && h.Days[0].Models.Count == 1 && Math.Abs(h.Days[0].Models[0].Tokens - 350) < 1e-9);
+            });
+            test("JWT display parsing fails closed on malformed tokens", () => { Require(J.Jwt("bad") == null && J.Jwt("a.!.c") == null); });
+            test("Direct proxy selection does not inherit ambient SOCKS settings", () => { Require(ProviderService.ResolveProxy("direct") == ""); });
+            test("Explicit HTTP proxy is preserved and unsupported schemes rejected", () => {
+                Require(ProviderService.ResolveProxy("http://127.0.0.1:7890") == "http://127.0.0.1:7890"); bool rejected = false; try { ProviderService.ResolveProxy("socks5://127.0.0.1:7890"); } catch (ArgumentException) { rejected = true; } Require(rejected);
+            });
+            test("scutil --proxy output with standard spaces parses; HTTPS preferred, HTTP falls back", () => {
+                // 真实 scutil --proxy 的行形如 "HTTPSEnable : 1"（冒号两侧都有空格）；
+                // 旧实现只认无空格形式，系统代理会被漏掉。以下全部是合成输出，不读真实系统代理。
+                string spaced = "<dictionary> {\n  HTTPSEnable : 1\n  HTTPSProxy : 127.0.0.1\n  HTTPSPort : 9876\n  HTTPEnable : 1\n  HTTPProxy : 10.0.0.2\n  HTTPPort : 8080\n  SOCKSEnable : 1\n  SOCKSProxy : 9.9.9.9\n  SOCKSPort : 1080\n  ExceptionsList : <array> {\n    0 : 192.168.0.0/16\n  }\n}\n";
+                Require(ProviderService.ParseScutilProxy(spaced) == "127.0.0.1:9876");
+                // 无空格形式继续兼容；HTTPS 关闭时回退 HTTP。
+                Require(ProviderService.ParseScutilProxy("HTTPSEnable:1\nHTTPSProxy:proxy.local\nHTTPSPort:8080") == "proxy.local:8080");
+                Require(ProviderService.ParseScutilProxy("HTTPSEnable : 0\nHTTPEnable : 1\nHTTPProxy : 10.0.0.2\nHTTPPort : 8080") == "10.0.0.2:8080");
+                // 只有 host 没有 port；未启用、空输出与 null 都回空串。
+                Require(ProviderService.ParseScutilProxy("HTTPSEnable : 1\nHTTPSProxy : gateway.corp") == "gateway.corp");
+                Require(ProviderService.ParseScutilProxy("HTTPSEnable : 1") == "" && ProviderService.ParseScutilProxy("") == "" && ProviderService.ParseScutilProxy(null) == "");
+            });
+            test("Plan formatting maps plan ids to display names", () => {
+                Require(UsageDetails.PlanName("pro") == "Pro 20x" && UsageDetails.PlanName("pro_lite") == "Pro 5x" && UsageDetails.PlanName("custom-plan") == "custom-plan");
+            });
+            test("Pace reserve and headroom are derived from elapsed time", () => {
+                DateTime now = new DateTime(2026, 1, 10, 12, 0, 0, DateTimeKind.Utc);
+                var q = new Quota { Used = 66, WindowSeconds = 604800, ResetUtc = now.AddHours(12).ToString("o") };
+                var p = UsageDetails.Pace(q, now);
+                Require(p != null && Math.Abs(p.Reserve - 26.857142857) < .0001 && p.Lasts && p.SpeedMultiplier > 1.5);
+            });
+            test("Pace predicts depletion for a deficit and rejects invalid windows", () => {
+                DateTime now = new DateTime(2026, 1, 10, 12, 0, 0, DateTimeKind.Utc);
+                var q = new Quota { Used = 70, WindowSeconds = 604800, ResetUtc = now.AddDays(5).ToString("o") };
+                var p = UsageDetails.Pace(q, now); Require(p != null && p.Reserve < 0 && !p.Lasts && p.SecondsUntilEmpty.HasValue);
+                q.WindowSeconds = 0; Require(UsageDetails.Pace(q, now) == null);
+                q.WindowSeconds = 604800; q.ResetUtc = now.AddDays(8).ToString("o"); Require(UsageDetails.Pace(q, now) == null);
+            });
+            test("Reset credit inventory excludes expired and redeemed expiry entries", () => {
+                var state = new ProviderState(); var now = new DateTime(2026, 1, 10, 0, 0, 0, DateTimeKind.Utc);
+                UsageDetails.ParseResetCredits(state, J.Parse("{\"available_count\":2,\"credits\":[{\"status\":\"available\",\"expires_at\":\"2026-01-20T00:00:00Z\"},{\"status\":\"redeemed\",\"expires_at\":\"2026-01-25T00:00:00Z\"},{\"status\":\"available\",\"expires_at\":\"2026-01-01T00:00:00Z\"}]}"), now);
+                Require(state.ResetCreditsAvailable == 2 && state.ResetCreditExpiries.Count == 1);
+            });
+            test("No reset credits is different from an unavailable reset endpoint", () => {
+                var state = new ProviderState(); UsageDetails.ParseResetCredits(state, J.Parse("{}"), DateTime.UtcNow); Require(!state.ResetCreditsAvailable.HasValue);
+                UsageDetails.ParseResetCredits(state, J.Parse("{\"available_count\":0,\"credits\":[]}"), DateTime.UtcNow); Require(state.ResetCreditsAvailable == 0);
+            });
+            test("Current-window estimates exclude the partial opening day and future rows", () => {
+                DateTime now = new DateTime(2026, 1, 17, 4, 0, 0, DateTimeKind.Utc);
+                var q = new Quota { WindowSeconds = 604800, ResetUtc = new DateTime(2026, 1, 20, 4, 0, 0, DateTimeKind.Utc).ToString("o") };
+                var days = new[] { new DayUsage { Day = "2026-01-13", Tokens = 100 }, new DayUsage { Day = "2026-01-14", Tokens = 200 }, new DayUsage { Day = "2026-01-17", Tokens = 300 }, new DayUsage { Day = "2026-01-19", Tokens = 500 } };
+                var usage = UsageDetails.Window(days, q, now, 0, null, TimeZones.Find("China Standard Time")); Require(!usage.Exact && usage.Days.Count == 2 && usage.Tokens == 500);
+            });
+            test("Price sync accepts only a dated, complete catalogue", () => {
+                string date; var many = String.Join(",", Enumerable.Range(0, 120).Select(i => "\"m" + i + "\":{\"in\":1,\"out\":2}"));
+                Require(Pricing.Valid("{\"updated\":\"2026-10-01\",\"models\":{" + many + "}}", out date) && date == "2026-10-01");
+                Require(!Pricing.Valid("{\"updated\":\"2026-10-01\",\"models\":{\"a\":{\"in\":1,\"out\":2}}}", out date));
+                Require(!Pricing.Valid("{\"updated\":\"yesterday\",\"models\":{" + many + "}}", out date));
+                Require(Pricing.Valid("{\"updated\":\"2026-10-01T02:17Z\",\"models\":{" + many + "}}", out date) && String.CompareOrdinal(date, "2026-10-01") > 0);
+                Require(!Pricing.Valid("<html>rate limited</html>", out date));
+                Require(Pricing.Valid(File.ReadAllText(Path.Combine(Store.Root, "pricing.json")), out date));
+            });
+            test("Pricing: cache writes, 1-hour writes, whole-request and marginal long-context tiers", () => {
+                Pricing.LoadJson("{\"updated\":\"t\",\"models\":{\"t-model\":{\"in\":10,\"out\":50,\"cr\":1,\"cw\":12.5,\"long\":{\"at\":272000,\"in\":20,\"out\":75,\"cr\":2},\"fast\":2},\"c-model\":{\"in\":3,\"out\":15},\"m-model\":{\"in\":1,\"out\":2,\"long\":{\"at\":200000,\"marginal\":true,\"in\":2,\"out\":4}},\"g-5\":{\"in\":1,\"out\":1}}}");
+                try {
+                    ModelPrice t = Pricing.Find("t-model"), c = Pricing.Find("c-model"), m = Pricing.Find("m-model");
+                    Require(Math.Abs(Pricing.CodexCost(t, 300000, 200000, 0, 1000) - 2.475) < 1e-9 && Math.Abs(Pricing.CodexCost(t, 1000, 900, 0, 10) - 0.0024) < 1e-12 && t.Fast == 2);
+                    Require(Math.Abs(Pricing.Cost(c, new TokenUse { Input = 1000, Output = 100, CacheRead = 10000, CacheWrite5m = 2000, CacheWrite1h = 1000 }) - 0.021) < 1e-12);
+                    Require(Math.Abs(Pricing.Cost(m, new TokenUse { Input = 300000 }) - 0.4) < 1e-12);
+                    Require(Math.Abs(Pricing.Cost(t, new TokenUse { Input = 100000, CacheRead = 200000 }) - (100000 * 20e-6 + 200000 * 2e-6)) < 1e-9);
+                    Require(Pricing.Find("t-model(xhigh)") == t && Pricing.Find("provider/t-model-20260101") == t && Pricing.Find("g-5-4") == null && Pricing.Find("g-5.4") == null && Pricing.Find("g-5-20260101") != null);
+                } finally { Pricing.Load(Path.Combine(Store.Root, "pricing.json")); }
+            });
+            test("History merge never shrinks a past day and always replaces today", () => {
+                var old = new UsageHistory { Zone = "Z", Days = { new DayUsage { Day = "2026-09-27", Agent = "codex", Tokens = 12000 }, new DayUsage { Day = "2026-09-28", Agent = "codex", Tokens = 10 }, new DayUsage { Day = "2026-09-29", Agent = "codex", Tokens = 999 }, new DayUsage { Day = "2026-08-01", Agent = "codex", Tokens = 5 } } };
+                var next = new UsageHistory { Zone = "Z", Days = { new DayUsage { Day = "2026-09-27", Agent = "codex", Tokens = 11000 }, new DayUsage { Day = "2026-09-28", Agent = "codex", Tokens = 20 }, new DayUsage { Day = "2026-09-29", Agent = "codex", Tokens = 50 } } };
+                var merged = HistoryService.Merge(old, next, "2026-08-31", "2026-09-29");
+                Require(merged.Days.Count == 3 && merged.Days.First(d => d.Day == "2026-09-27").Tokens == 12000 && merged.Days.First(d => d.Day == "2026-09-28").Tokens == 20 && merged.Days.First(d => d.Day == "2026-09-29").Tokens == 50);
+                var otherZone = new UsageHistory { Zone = "Y", Days = { new DayUsage { Day = "2026-09-27", Agent = "codex", Tokens = 1 } } };
+                Require(HistoryService.Merge(old, otherZone, "2026-08-31", "2026-09-29").Days.Count == 1);
+            });
+            test("Codex log reader counts token_count once, skips repeats, keeps an unfinished tail", () => {
+                string a = "{\"timestamp\":\"2026-09-27T02:10:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":900,\"output_tokens\":50,\"reasoning_output_tokens\":10,\"total_tokens\":1050},\"last_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":900,\"output_tokens\":50,\"total_tokens\":1050}}}}";
+                string repeat = a.Replace("02:10:00", "02:11:00");
+                string noise = "{\"timestamp\":\"2026-09-27T02:12:00.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"text\":\"" + new string('x', 300000) + "\"}}";
+                string nullInfo = "{\"timestamp\":\"2026-09-27T02:13:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}";
+                string b = "{\"timestamp\":\"2026-09-27T03:05:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":3000,\"cached_input_tokens\":2700,\"output_tokens\":80,\"reasoning_output_tokens\":10,\"total_tokens\":3080},\"last_token_usage\":{\"input_tokens\":2000,\"cached_input_tokens\":1800,\"output_tokens\":30,\"total_tokens\":2030}}}}";
+                byte[] bytes = System.Text.Encoding.UTF8.GetBytes(a + "\n" + repeat + "\n" + noise + "\n" + nullInfo + "\n" + b.Substring(0, 40));
+                var index = new LogIndex(); var state = new LogFile();
+                long offset; using (var stream = new MemoryStream(bytes)) offset = CodexLogs.Read(index, state, "none", stream, 0);
+                // No turn_context yet: the model falls back to gpt-5, as Codex itself does.
+                Bucket first = state.Hours["2026092702|openai|gpt-5"];
+                Require(state.Hours.Count == 1 && first.Tokens() == 1050 && first.I == 100 && first.C == 900 && first.R == 1 && offset == bytes.Length - 40);
+                byte[] rest = System.Text.Encoding.UTF8.GetBytes(b + "\n");
+                using (var stream = new MemoryStream(rest)) CodexLogs.Read(index, state, "none", stream, offset);
+                Require(state.Hours["2026092703|openai|gpt-5"].Tokens() == 2030);
+            });
+            test("Codex buckets carry the session's provider and model; subscription windows skip relays", () => {
+                string meta = "{\"timestamp\":\"2026-09-27T02:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"x\",\"model_provider\":\"custom\"}}";
+                string turn = "{\"timestamp\":\"2026-09-27T02:00:01.000Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"demo-model\"}}";
+                string tier = "{\"timestamp\":\"2026-09-27T02:00:02.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"service_tier\":\"priority\"}}}";
+                string count = "{\"timestamp\":\"2026-09-27T02:05:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":500,\"output_tokens\":20},\"last_token_usage\":{\"input_tokens\":500,\"output_tokens\":20}}}}";
+                var state = new LogFile();
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(meta + "\n" + turn + "\n" + tier + "\n" + count + "\n"))) CodexLogs.Read(new LogIndex(), state, "none", stream, 0);
+                Require(state.Hours.ContainsKey("2026092702|custom|demo-model") && state.Hours["2026092702|custom|demo-model"].Tokens() == 520 && state.Tier == "fast");
+                var index = new LogIndex { CoveredFrom = "2026-09-01T00:00:00Z" }; index.Files.Add(state);
+                index.Files.Add(new LogFile { Hours = { { "2026092703|openai|demo-model", new Bucket { I = 100, R = 1 } } } });
+                var q = new Quota { WindowSeconds = 604800, ResetUtc = "2026-10-01T00:00:00Z" };
+                var usage = UsageDetails.Window(new DayUsage[0], q, new DateTime(2026, 9, 28, 0, 0, 0, DateTimeKind.Utc), 0, index, TimeZoneInfo.Utc, CodexLogs.IsOfficial);
+                Require(usage.Exact && Math.Abs(usage.Tokens - 100) < 1e-9);
+            });
+            test("Claude log entries are de-duplicated by message id + request id; the larger copy wins", () => {
+                Func<string, string, string, int, string> line = (id, model, stamp, output) => "{\"type\":\"assistant\",\"timestamp\":\"" + stamp + "\",\"requestId\":\"req_" + id + "\",\"message\":{\"id\":\"" + id + "\",\"model\":\"" + model + "\",\"usage\":{\"input_tokens\":10,\"output_tokens\":" + output + ",\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":1000}}}";
+                string text = line("msg_a", "demo-claude", "2026-09-27T02:00:00Z", 5) + "\n" + line("msg_a", "demo-claude", "2026-09-27T02:00:01Z", 5) + "\n" + line("msg_b", "<synthetic>", "2026-09-27T02:01:00Z", 5) + "\n" + line("msg_c", "demo-claude", "2026-09-27T03:00:00Z", 5) + "\n" + line("msg_c", "demo-claude", "2026-09-27T03:00:02Z", 50) + "\n";
+                var index = new LogIndex(); var state = new LogFile { Name = "s.jsonl" }; index.Files.Add(state);
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(text))) ClaudeLogs.Read(index, state, "s.jsonl", stream, 0);
+                Require(state.Hours["2026092702||demo-claude"].Tokens() == 1115 && state.Hours["2026092702||demo-claude"].R == 1 && state.Hours["2026092702||"].Tokens() == 1115 && state.Hours["2026092703||demo-claude"].O == 50 && state.Hours["2026092703||demo-claude"].R == 1);
+                // Without requestId: same id + same timestamp is a copy, a new timestamp is not.
+                string bare = "{\"type\":\"assistant\",\"timestamp\":\"2026-09-27T04:00:00Z\",\"message\":{\"id\":\"msg_d\",\"model\":\"demo-claude\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}";
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(bare + "\n" + bare + "\n" + bare.Replace("04:00:00", "04:00:09") + "\n"))) ClaudeLogs.Read(index, state, "s.jsonl", stream, 0);
+                Require(state.Hours["2026092704|" + ClaudeLogs.NoRequestId + "|demo-claude"].Tokens() == 4 && state.Hours["2026092704|" + ClaudeLogs.NoRequestId + "|demo-claude"].R == 2);
+                // A null id is malformed and skipped; sub-agent progress lines count.
+                string malformed = "{\"type\":\"assistant\",\"timestamp\":\"2026-09-27T05:00:00Z\",\"message\":{\"id\":null,\"model\":\"demo-claude\",\"usage\":{\"input_tokens\":7,\"output_tokens\":7}}}";
+                string progress = "{\"type\":\"progress\",\"sessionId\":\"s1\",\"data\":{\"message\":{\"timestamp\":\"2026-09-27T05:10:00Z\",\"requestId\":\"req_p\",\"message\":{\"id\":\"msg_p\",\"model\":\"demo-claude\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}}}";
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(malformed + "\n" + progress + "\n"))) ClaudeLogs.Read(index, state, "s.jsonl", stream, 0);
+                Require(state.Hours["2026092705||demo-claude"].Tokens() == 5);
+            });
+            test("Output speed (Codex): last tool output / prompt → last model item, across reads; short replies skipped", () => {
+                Func<string, string, string> item = (stamp, payload) => "{\"timestamp\":\"2026-09-27T" + stamp + "Z\",\"type\":\"response_item\",\"payload\":{" + payload + "}}";
+                Func<string, int, int, string> count = (stamp, total, last) => "{\"timestamp\":\"2026-09-27T" + stamp + "Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":" + (total * 10) + ",\"output_tokens\":" + total + "},\"last_token_usage\":{\"input_tokens\":" + (last * 10) + ",\"output_tokens\":" + last + "}}}}";
+                string first = String.Join("\n", new[] {
+                    item("10:00:00.000", "\"type\":\"message\",\"role\":\"user\",\"content\":[]"),
+                    "{\"timestamp\":\"2026-09-27T10:00:00.500Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"demo-model\"}}",
+                    item("10:00:12.000", "\"type\":\"reasoning\",\"summary\":[]") }) + "\n";
+                string rest = String.Join("\n", new[] {
+                    item("10:00:20.000", "\"type\":\"custom_tool_call\",\"name\":\"apply_patch\""),
+                    item("10:00:22.000", "\"type\":\"custom_tool_call_output\",\"output\":\"ok\""),
+                    count("10:00:22.010", 1000, 1000),
+                    item("10:00:40.000", "\"type\":\"reasoning\",\"summary\":[]"),
+                    item("10:00:47.000", "\"type\":\"message\",\"role\":\"assistant\",\"content\":[]"),
+                    count("10:00:47.100", 1500, 500),
+                    item("10:05:00.000", "\"type\":\"message\",\"role\":\"user\",\"content\":[]"),
+                    item("10:05:03.000", "\"type\":\"message\",\"role\":\"assistant\",\"content\":[]"),
+                    count("10:05:03.100", 1520, 20) }) + "\n";
+                var index = new LogIndex(); var state = new LogFile();
+                long offset; using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(first))) offset = CodexLogs.Read(index, state, "none", stream, 0);
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(rest))) CodexLogs.Read(index, state, "none", stream, offset);
+                Bucket b = state.Hours["2026092710|openai|demo-model"];
+                // 20 s (10:00:00 → 10:00:20) + 25 s (10:00:22 → 10:00:47); the 20-token reply is not timed.
+                Require(b.R == 3 && b.TN == 2 && b.TO == 1500 && Math.Abs(b.TS - 45) < 1e-9 && Math.Abs(b.Speed().Value - 1500 / 45.0) < 1e-9);
+            });
+            test("Output speed (Claude): parent entry → last block, across reads and files; quoted keys in text ignored", () => {
+                Func<string, string, string, string, int, string> block = (id, uuid, parent, stamp, output) => "{\"parentUuid\":\"" + parent + "\",\"type\":\"assistant\",\"requestId\":\"req_" + id + "\",\"message\":{\"id\":\"" + id + "\",\"model\":\"demo-claude\",\"usage\":{\"input_tokens\":10,\"output_tokens\":" + output + "}},\"uuid\":\"" + uuid + "\",\"timestamp\":\"2026-09-27T" + stamp + "Z\"}";
+                string user = "{\"parentUuid\":null,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"uuid\":\"u1\",\"timestamp\":\"2026-09-27T11:00:00.000Z\"}";
+                string toolResult = "{\"parentUuid\":\"a2\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":\"x \\\"uuid\\\":\\\"a1\\\",\\\"timestamp\\\":\\\"2026-09-27T09:00:00Z\\\"\"}]},\"uuid\":\"u2\",\"timestamp\":\"2026-09-27T11:00:30.000Z\"}";
+                string system = "{\"parentUuid\":\"a3\",\"type\":\"system\",\"timestamp\":\"2026-09-27T11:01:00.000Z\",\"uuid\":\"s1\"}";
+                string first = user + "\n" + block("m1", "a1", "u1", "11:00:06.000", 800) + "\n";
+                string rest = String.Join("\n", new[] { block("m1", "a2", "a1", "11:00:10.000", 800), toolResult, block("m2", "a3", "u2", "11:00:45.000", 30), system, block("m3", "a4", "s1", "11:01:20.000", 400) }) + "\n";
+                var index = new LogIndex(); var state = new LogFile { Name = "s.jsonl" }; index.Files.Add(state);
+                long offset; using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(first))) offset = ClaudeLogs.Read(index, state, "s.jsonl", stream, 0);
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(rest))) ClaudeLogs.Read(index, state, "s.jsonl", stream, offset);
+                Bucket b = state.Hours["2026092711||demo-claude"];
+                // m1: 11:00:00 → 11:00:10 = 10 s; m2 has 30 output tokens (skipped); m3: 11:01:00 → 11:01:20 = 20 s.
+                Require(b.R == 3 && b.TN == 2 && b.TO == 1200 && Math.Abs(b.TS - 30) < 1e-9);
+                // The same responses copied into another file are not timed again.
+                var copy = new LogFile { Name = "t.jsonl" }; index.Files.Add(copy);
+                using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(first + rest))) ClaudeLogs.Read(index, copy, "t.jsonl", stream, 0);
+                Require(copy.Hours.Values.Sum(x => x.TN) == 0 && state.Hours["2026092711||demo-claude"].TN == 2);
+            });
+            test("Output speed (Grok, history): recorded API time per turn; timing reaches the daily rows", () => {
+                string line = "{\"timestamp\":1750000000,\"params\":{\"sessionId\":\"sess-1\",\"update\":{\"sessionUpdate\":\"turn_completed\",\"usage\":{\"modelUsage\":{\"grok-demo\":{\"inputTokens\":100,\"outputTokens\":1000,\"modelCalls\":2,\"apiDurationMs\":20000},\"grok-mini\":{\"inputTokens\":10,\"outputTokens\":60,\"modelCalls\":2,\"apiDurationMs\":3000}}}},\"_meta\":{\"eventId\":\"evt-2\"}}}";
+                var index = new LogIndex(); var file = new LogFile(); index.Files.Add(file);
+                AgentLogs.GrokLine(index, file, line, "s", null);
+                Bucket b = file.Hours["2025061515||grok-demo"], mini = file.Hours["2025061515||grok-mini"];
+                Require(b.TN == 2 && b.TO == 1000 && b.TS == 20 && b.Speed() == 50 && mini.TN == 0);
+                UsageHistory h = HistoryService.FromIndexes(new Dictionary<string, LogIndex> { { "grok", index } }, TimeZoneInfo.Utc, new DateTime(2025, 6, 15), 30);
+                DayUsage row = h.Days.Single();
+                Require(row.TimedRequests == 2 && row.TimedOutput == 1000 && row.TimedSeconds == 20 && row.Models.First(m => m.Model == "grok-demo").TimedSeconds == 20);
+                Require(OutputTiming.Speed(1000, .5) == null && OutputTiming.Text(null) == "—" && OutputTiming.Text(50) == "50 t/s" && OutputTiming.Text(103.4) == "103 t/s" && OutputTiming.Text(9.46) == "9.5 t/s");
+                Require(!OutputTiming.Accept(49, 10) && !OutputTiming.Accept(1000, 601) && OutputTiming.Accept(1000, 20) && OutputTiming.Supported("codex") && !OutputTiming.Supported("antigravity"));
+            });
+            test("Codex endpoint is read from model_provider, profiles and provider tables", () => {
+                string toml = "model = \"m\"\nmodel_provider = \"custom\"\n[projects.'D:\\x.y']\ntrust_level = \"trusted\"\n[model_providers.\"custom\"]\nname = \"custom\"\nbase_url = \"https://Relay.Example.com/v1\" # comment\n";
+                Require(Endpoints.ActiveCodexProvider(toml) == "custom" && Endpoints.Host(Endpoints.Toml(toml, "model_providers.custom", "base_url")) == "relay.example.com");
+                Require(Endpoints.ActiveCodexProvider("profile = \"p\"\n[profiles.p]\nmodel_provider = \"alt\"\n") == "alt" && Endpoints.ActiveCodexProvider("model = \"m\"\n") == "openai");
+                Require(Endpoints.Host("http://127.0.0.1:15721") == "127.0.0.1:15721" && Endpoints.Host("not a url") == "");
+                string fingerprint = Endpoints.Fingerprint("sk-test-123456");
+                Require(fingerprint.Length == 6 && fingerprint == Endpoints.Fingerprint(" sk-test-123456 ") && Endpoints.Fingerprint("") == "");
+            });
+            test("Third-party usage follows the switch timeline; history before tracking stays unattributed", () => {
+                var log = new EndpointLog();
+                log.Marks.Add(new EndpointMark { App = "claude", Official = true, Since = "2026-09-20T00:00:00Z" });
+                log.Marks.Add(new EndpointMark { App = "claude", Host = "relay.example.com", Key = "abc123", Name = "Relay", Since = "2026-09-25T00:00:00Z" });
+                var claude = new LogIndex(); claude.Files.Add(new LogFile { Hours = { { "2026091810||m", new Bucket { I = 7, R = 1 } }, { "2026092210||m", new Bucket { I = 50, R = 1 } }, { "2026092610||m", new Bucket { I = 300, R = 2, D = 3 } }, { "2026092310|" + ClaudeLogs.NoRequestId + "|m", new Bucket { I = 20, R = 1 } }, { "2026091010|" + ClaudeLogs.NoRequestId + "|m", new Bucket { I = 5, R = 1 } } } });
+                var codex = new LogIndex(); codex.Files.Add(new LogFile { Hours = { { "2026092610|custom|g", new Bucket { I = 40, R = 1, U = 40 } }, { "2026092610|openai|g", new Bucket { I = 900, R = 3 } } } });
+                var report = ThirdPartyReport.Build(codex, claude, log, new UsageHistory(), new DateTime(2026, 9, 29, 12, 0, 0, DateTimeKind.Utc), TimeZoneInfo.Utc);
+                var relay = report.Endpoints.First(e => e.App == "claude" && e.Host.Length > 0); var unknown = report.Endpoints.First(e => e.App == "codex");
+                var bare = report.Endpoints.First(e => e.Key == ClaudeLogs.NoRequestId);
+                Require(report.Endpoints.Count == 3 && relay.Current && relay.Month == 300 && relay.Requests == 2 && Math.Abs(relay.CostMonth - 3) < 1e-9 && relay.Week == 300 && relay.Today == 0);
+                // No request-id: a relay even while settings.json looked official, and before tracking.
+                Require(bare.Month == 25 && !bare.Current && unknown.Host == "" && unknown.Month == 40 && unknown.CostPartial && report.ClaudeUnattributed == 7 && report.AppMonth("claude") == 325);
+            });
+            test("The running hour counts in full up to now; past range edges still split by overlap", () => {
+                DateTime hour = new DateTime(2026, 9, 30, 10, 0, 0, DateTimeKind.Utc), now = hour.AddMinutes(15);
+                var index = new LogIndex(); index.Files.Add(new LogFile { Name = "a.jsonl", Hours = { { "2026093010|openai|m", new Bucket { I = 1000, D = 4, R = 4 } }, { "2026093008|openai|m", new Bucket { I = 1000, D = 4, R = 4 } } } });
+                // "Today until now" at 10:15: the 10:00 bucket already holds everything up to now.
+                Bucket today = index.Usage(hour.AddHours(-10), now, null, null, now);
+                Require(Math.Abs(today.Tokens() - 2000) < 1e-9 && Math.Abs(today.D - 8) < 1e-9 && Math.Abs(today.R - 8) < 1e-9);
+                // A range ending at 08:15, asked at 10:15, takes a quarter of the 08:00 bucket.
+                Require(Math.Abs(index.Usage(hour.AddHours(-3), hour.AddHours(-2).AddMinutes(15), null, null, now).Tokens() - 250) < 1e-9);
+                Require(LogIndex.Weight(hour, hour.AddMinutes(-30), now, now) == 1 && LogIndex.Weight(hour, now, hour.AddHours(1), now) == 0 && LogIndex.Weight(hour.AddHours(-2), hour.AddHours(-2).AddMinutes(30), hour, now) == .5);
+            });
+            test("Switching relay inside an hour attributes each request to the endpoint in effect then", () => {
+                var log = new EndpointLog();
+                log.Marks.Add(new EndpointMark { App = "claude", Host = "a.example.com", Key = "aaaaaa", Name = "A", Since = "2026-09-30T09:00:00Z" });
+                log.Marks.Add(new EndpointMark { App = "claude", Host = "b.example.com", Key = "bbbbbb", Name = "B", Since = "2026-09-30T10:30:00Z" });
+                EndpointAttribution.Use(log);
+                try {
+                    // Switched A → B at 10:30; 900 tokens used on B at 10:40.
+                    string line = "{\"type\":\"assistant\",\"timestamp\":\"2026-09-30T10:40:00Z\",\"requestId\":\"req_x\",\"message\":{\"id\":\"msg_x\",\"model\":\"demo-claude\",\"usage\":{\"input_tokens\":800,\"output_tokens\":100}}}";
+                    var claude = new LogIndex(); var state = new LogFile { Name = "s.jsonl" }; claude.Files.Add(state);
+                    using (var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(line + "\n"))) ClaudeLogs.Read(claude, state, "s.jsonl", stream, 0);
+                    var report = ThirdPartyReport.Build(null, claude, log, new UsageHistory(), new DateTime(2026, 9, 30, 12, 0, 0, DateTimeKind.Utc), TimeZoneInfo.Utc);
+                    var a = report.Endpoints.FirstOrDefault(e => e.Name == "A"); var b = report.Endpoints.First(e => e.Name == "B");
+                    Require(b.Month == 900 && b.Current && (a == null || a.Month == 0));
+                } finally { EndpointAttribution.Use(null); }
+            });
+            test("Third-party dashboard ranks endpoints over a period and stacks bars by endpoint", () => {
+                var log = new EndpointLog();
+                log.Marks.Add(new EndpointMark { App = "claude", Host = "a.example.com", Key = "aaaaaa", Name = "A", Since = "2026-09-30T09:00:00Z" });
+                log.Marks.Add(new EndpointMark { App = "claude", Host = "b.example.com", Key = "bbbbbb", Name = "B", Since = "2026-09-30T10:30:00Z" });
+                var claude = new LogIndex(); claude.Files.Add(new LogFile { Name = "s.jsonl", Hours = {
+                    { "2026093009|anthropic|m1|a.example.com/aaaaaa", new Bucket { I = 1000, R = 2 } },
+                    { "2026093010|anthropic|m1|b.example.com/bbbbbb", new Bucket { I = 3000, R = 3, TN = 3, TO = 900, TS = 9 } },
+                    { "2026093010|anthropic|m2|", new Bucket { I = 5000, R = 1 } } } }); // official: not a relay
+                var codex = new LogIndex(); codex.Files.Add(new LogFile { Name = "r.jsonl", Hours = { { "2026093011|myrelay|gpt", new Bucket { I = 500, R = 1 } } } });
+                var period = ThirdPartyReport.Period(codex, claude, log, new DateTime(2026, 9, 30, 0, 0, 0), new DateTime(2026, 9, 30, 12, 0, 0), new DateTime(2026, 9, 30, 12, 0, 0, DateTimeKind.Utc), TimeZoneInfo.Utc);
+                Require(period.Hourly && period.Bars.Count == 12 && Math.Abs(period.Total.Tokens() - 4500) < 1e-9);
+                Require(period.Endpoints.Select(p => p.Label).SequenceEqual(new[] { "B", "A", "地址未记录的第三方接口" }));
+                EndpointPeriod top = period.Endpoints[0];
+                Require(top.Current && Math.Abs(top.Total.Speed().Value - 100) < 1e-9 && top.Color == ThirdPartyReport.Palette[0]);
+                ChartBar ten = period.Bars[10];
+                Require(ten.Parts.Count == 1 && ten.Parts[0].Name == "B" && Math.Abs(ten.Tokens - 3000) < 1e-9);
+                // A 4-hour window from 08:00 leaves B's 10:00 bucket in and the 11:00 Codex one out.
+                var narrow = ThirdPartyReport.Period(codex, claude, log, new DateTime(2026, 9, 30, 8, 0, 0), new DateTime(2026, 9, 30, 11, 0, 0), new DateTime(2026, 9, 30, 12, 0, 0, DateTimeKind.Utc), TimeZoneInfo.Utc);
+                Require(Math.Abs(narrow.Total.Tokens() - 4000) < 1e-9 && narrow.Endpoints.Last().Total.Tokens() == 0);
+            });
+            test("SQL export of one device imports once on another, never onto itself", () => {
+                string a = Path.Combine(Path.GetTempPath(), "cum-dev-a-" + Guid.NewGuid().ToString("N")), b = Path.Combine(Path.GetTempPath(), "cum-dev-b-" + Guid.NewGuid().ToString("N")), c = Path.Combine(Path.GetTempPath(), "cum-dev-c-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(a);
+                try {
+                    DateTime now = DateTime.UtcNow, h = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    Store.Write("device.json", new DeviceIdentity { Id = "deviceaaaa01", Name = "A-PC" });
+                    var codex = new LogIndex(); codex.Files.Add(new LogFile { Name = "r1.jsonl", Hours = { { LogIndex.BucketKey(h, "openai", "gpt-6"), new Bucket { I = 100, O = 10, R = 1, D = .5 } }, { LogIndex.BucketKey(h.AddHours(1), "myrelay", "gpt-6"), new Bucket { I = 40, R = 1 } } } });
+                    codex.Files.Add(new LogFile { Name = "r2.jsonl", Hours = { { LogIndex.BucketKey(h, "openai", "gpt-6"), new Bucket { I = 1, R = 1 } } } }); // same hour, other file: one row
+                    Store.Write("codex-logs.json", codex);
+                    var claude = new LogIndex(); claude.Files.Add(new LogFile { Name = "s.jsonl", Hours = { { LogIndex.BucketKey(h, "anthropic", "opus", "relay.example.com/abc123"), new Bucket { I = 200, R = 2 } } } });
+                    Store.Write("claude-logs.json", claude);
+                    var cursor = new LogIndex(); cursor.Files.Add(new LogFile { Name = "cursor-dashboard", Hours = { { LogIndex.BucketKey(h, "", "auto"), new Bucket { I = 999, R = 1 } } } });
+                    Store.Write("cursor-logs.json", cursor);
+                    string sql = Devices.ExportSql(now, true);
+                    Require(sql.Contains("CREATE TABLE IF NOT EXISTS cum_usage_hours") && !sql.Contains("'cursor'") && sql.Contains("'A-PC'"));
+                    Require(Devices.ImportSql(sql, now).Own == 3);                       // onto itself: nothing
+                    Store.SwapData(b);
+                    Store.Write("device.json", new DeviceIdentity { Id = "devicebbbb02", Name = "B-PC" });
+                    ImportResult first = Devices.ImportSql(sql, now), again = Devices.ImportSql(sql, now);
+                    Require(first.Added == 3 && first.Devices.SequenceEqual(new[] { "A-PC" }) && again.Rows == 0 && again.Same == 3);
+                    // An older export of the same hours never lowers them.
+                    Require(Devices.ImportSql(sql.Replace(", 101, ", ", 50, "), now).Same == 3 && Math.Abs(Devices.Imported().Single().Tokens() - 351) < 1e-9);
+                    DeviceData imported = Devices.Imported().Single();
+                    Require(imported.Id == "deviceaaaa01" && Math.Abs(imported.Tokens() - 351) < 1e-9 && Math.Abs(imported.Cost() - .5) < 1e-9);
+                    Dictionary<string, LogIndex> merged = Devices.Attach(new Dictionary<string, LogIndex>(), Devices.Imported());
+                    Require(merged.ContainsKey("codex") && merged.ContainsKey("claude") && !merged.ContainsKey("cursor"));
+                    Require(merged["codex"].Entries().Any(e => e.Provider == "myrelay" && e.Endpoint == "?") && merged["claude"].Entries().Single().Endpoint == "relay.example.com/abc123");
+                    // A hand-edited id that is not a plain name is refused.
+                    Require(Devices.ImportSql(sql.Replace("'deviceaaaa01'", "'../evil'"), now).Skipped == 3);
+                    Devices.Remove("deviceaaaa01"); Require(Devices.Imported().Count == 0);
+                    // C already has the same Codex hour in its own logs (copied or synced): left out.
+                    Store.SwapData(c);
+                    Store.Write("device.json", new DeviceIdentity { Id = "devicecccc03", Name = "C-PC" });
+                    var mine = new LogIndex(); mine.Files.Add(new LogFile { Name = "copied.jsonl", Hours = { { LogIndex.BucketKey(h, "openai", "gpt-6"), new Bucket { I = 101, O = 10, R = 2 } } } }); Store.Write("codex-logs.json", mine);
+                    ImportResult copied = Devices.ImportSql(sql, now);
+                    Require(copied.Duplicate == 1 && copied.Added == 2 && Math.Abs(Devices.Imported().Single().Tokens() - 240) < 1e-9);
+                } finally { Store.SwapData(previous); foreach (string dir in new[] { a, b, c }) { try { Directory.Delete(dir, true); } catch { } } }
+            });
+            test("A remote copy that later duplicates local logs is removed, not counted twice", () => {
+                // review #5：远端副本先导入、相同日志随后同步到本机，再次导入识别为重复时
+                // 必须移除已存的远端 bucket，否则 Attach 仍把它并进本机索引造成双计。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-dup-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow, h = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    string values = "'deviceaaaa01', 'codex', '" + h.ToString("yyyy-MM-ddTHH:00:00Z") + "', 'openai', 'gpt-6', NULL, 100, 0, 0, 10, 0, 1, 0.5, 0, 0, 0, 0";
+                    string sql = "INSERT INTO cum_devices (device_id, name, exported_utc, app_version) VALUES ('deviceaaaa01', 'A-PC', NULL, 't');\nINSERT INTO cum_usage_hours (device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds) VALUES (" + values + ");\n";
+                    Store.Write("device.json", new DeviceIdentity { Id = "devicecccc03", Name = "C-PC" });
+                    Require(Devices.ImportSql(sql, now).Added == 1);                        // 远端先到：副本已导入
+                    var local = new LogIndex(); local.Files.Add(new LogFile { Name = "copied.jsonl", Hours = { { LogIndex.BucketKey(h, "openai", "gpt-6"), new Bucket { I = 100, O = 10, R = 1, D = .5 } } } });
+                    Store.Write("codex-logs.json", local);                                  // 相同日志随后同步到了本机
+                    Require(Devices.ImportSql(sql, now).Duplicate == 1);                    // 再导入识别为重复
+                    Dictionary<string, Bucket> left;
+                    bool removed = !Devices.Imported().Single().Agents.TryGetValue("codex", out left) || left.Count == 0;
+                    Require(removed);                                                       // 已存的远端副本被移除
+                    var merged = Devices.Attach(new Dictionary<string, LogIndex> { { "codex", local } }, Devices.Imported());
+                    Require(Math.Abs(merged["codex"].Entries().Sum(e => e.Tokens) - 110) < 1e-9);   // 110，而不是双计的 220
+                    Require(Devices.ImportSql(sql, now).Duplicate == 1 && Math.Abs(Devices.Attach(new Dictionary<string, LogIndex> { { "codex", local } }, Devices.Imported())["codex"].Entries().Sum(e => e.Tokens) - 110) < 1e-9);
+                    // 旧版本未经导入侧清理就存下的重复副本，合并侧同样挡住（同一口径的 totals）。
+                    var legacy = new DeviceData { Id = "devicebbbb02", Name = "B-PC" };
+                    legacy.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) { { LogIndex.BucketKey(h, "openai", "gpt-6", ""), new Bucket { I = 100, O = 10, R = 1 } } };
+                    var merged2 = Devices.Attach(new Dictionary<string, LogIndex> { { "codex", local } }, new List<DeviceData> { legacy });
+                    Require(merged2["codex"].Files.Count == 1 && Math.Abs(merged2["codex"].Entries().Sum(e => e.Tokens) - 110) < 1e-9);
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("A same-size re-export corrects cost and timing; replays and older exports stay put", () => {
+                // review #6：Token/请求数相同、费用与计时补全的导出要能更新；完全相同的重放
+                // 仍是 Same（去重语义不变）。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-meta-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow, h = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    string head = "INSERT INTO cum_usage_hours (device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds) VALUES ('deviceaaaa01', 'codex', '" + h.ToString("yyyy-MM-ddTHH:00:00Z") + "', 'openai', 'gpt-6', NULL, ";
+                    Func<string, string> sql = nums => head + nums + ";\n";
+                    Store.Write("device.json", new DeviceIdentity { Id = "devicecccc03", Name = "C-PC" });
+                    Require(Devices.ImportSql(sql("100, 0, 0, 10, 0, 1, 0, 0, 0, 0, 0"), now).Added == 1);
+                    ImportResult fix = Devices.ImportSql(sql("100, 0, 0, 10, 0, 1, 5, 0, 1, 10, 10"), now);   // 相同计数：费用 5、计时 10s
+                    Require(fix.Updated == 1 && fix.Rows == 1);
+                    Bucket stored = Devices.Imported().Single().Agents["codex"].Values.Single();
+                    Require(Math.Abs(stored.D - 5) < 1e-9 && stored.TN == 1 && stored.TO == 10 && Math.Abs(stored.TS - 10) < 1e-9 && Math.Abs(stored.Tokens() - 110) < 1e-9);
+                    Require(Devices.ImportSql(sql("100, 0, 0, 10, 0, 1, 5, 0, 1, 10, 10"), now).Same == 1);   // 重放：不再变化
+                    Require(Devices.ImportSql(sql("50, 0, 0, 10, 0, 1, 5, 0, 1, 10, 10"), now).Same == 1);    // 更旧的导出不会回退
+                    Require(Devices.ImportSql(sql("120, 0, 0, 10, 0, 2, 5, 0, 1, 10, 10"), now).Updated == 1); // 用量增长仍更新
+                    Require(Math.Abs(Devices.Imported().Single().Agents["codex"].Values.Single().Tokens() - 130) < 1e-9 && Math.Abs(Devices.Imported().Single().Cost() - 5) < 1e-9);
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Non-finite or absurd SQL numbers refuse the row and never abort the import", () => {
+                // review #12：1e999 解析成 Infinity，曾绕过校验、在保存阶段被 JSON 序列化
+                // 拒绝并中断多设备导入；现在保存前就拒行，其余设备照常导入。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-inf-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow, h = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    string head = "INSERT INTO cum_usage_hours (device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds) VALUES ";
+                    Func<string, string, string> row = (device, nums) => head + "('" + device + "', 'codex', '" + h.ToString("yyyy-MM-ddTHH:00:00Z") + "', 'openai', 'gpt-6', NULL, " + nums + ";\n";
+                    Store.Write("device.json", new DeviceIdentity { Id = "devicecccc03", Name = "C-PC" });
+                    ImportResult result = Devices.ImportSql(row("devicebbbb02", "100, 0, 0, 10, 0, 1, 1e999, 0, 0, 0, 0") + row("devicecccc04", "100, 0, 0, 10, 0, 1, 0.5, 0, 0, 0, 0"), now);
+                    Require(result.Skipped == 1 && result.Added == 1);                      // 无效行拒绝，后面的设备照常
+                    Require(Devices.Imported().Single().Id == "devicecccc04");
+                    Require(Devices.ImportSql(row("devicebbbb02", "100, 0, 0, 10, 0, 1, 1e300, 0, 0, 0, 0"), now).Skipped == 1);   // 有限但超出合理范围
+                    Require(Devices.ImportSql(row("devicebbbb02", "-5, 0, 0, 10, 0, 1, 0.5, 0, 0, 0, 0"), now).Skipped == 1);      // 负数拒绝
+                    Require(Devices.ImportSql(row("devicebbbb02", "100, 0, 0, 10, 0, 1, abc, 0, 0, 0, 0"), now).Added == 1);       // 不可解析按 0（既有行为）
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("ProbeWritable reports the real data path and reason for a read-only directory", () => {
+                // fix6 #2：设置保存失败曾只报泛化文案；现在保存前先写探测，错误必须携带
+                // 真实路径与原因（chmod 0500 制造只读目录 → UnauthorizedAccessException）。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-readonly-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    Directory.CreateDirectory(dir);
+                    Require(Store.ProbeWritable() == null);                                    // 可写目录：null
+                    File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                    string error = Store.ProbeWritable();
+                    Require(error != null && error.Contains(dir) && error.Contains("不可写"));
+                    File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                    Require(Store.ProbeWritable() == null);                                    // 权限恢复后回到可写
+                } finally {
+                    try { File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute); } catch { }
+                    Store.SwapData(previous);
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+            test("DeepSeek Harness sessions: zstd frames, model, cache and speed, read incrementally", () => {
+                // Synthetic session: header + message (2 s, 100 output) in two frames, then a
+                // flash request whose answer arrives in a third frame (20 output: not timed).
+                byte[] a = Convert.FromBase64String("KLUv/WDgAG0IAAaQMSFgh5sDtR+JyOJyAyo7jtw+QIUKluVVDdHfy/8UEAAWxAkoACkAJQCEGJP8k9dW5mhBKIeEQVEGUkIgyS9j9VGSbywfvZ82I+zBfn7do/8E7yjGt+cKB4ezTGMw2JTSwmKX3S7zXI72nGIdsKb+5GJ4y+g2SPPCxr5q9TbNHgzwfLNtdKe9P+m2eVFWoczLQJpp82LWO7p6sfU8a6wbhBhjSkviaLc+StvrGSAYXYJtlKqjhu0opZTkme2iFTR0bP1JeBQfEBsAMwnXSTRnYU0RsxuJ5yii+aHBKGu0oYhAgHVksQ0iawVwHEz2ZC+AZLjsw+/oDRzBXouVqPIChkC6mCAKCVW0XgoKKLUv/SCf3QMAQsgaG2CJdaCMJ2tPmqn7kZuPooghsVmwYzUhBmEDi4A5/cQtU1a7F/fQaE6zuAqifL3FyNI5T6kNJP7I/MvaFA8ySUPcU37Uj3rlLqPjSEYhpXQYIAwE9ZcmjQx182hk+LVnAhnvNIdWn1lIPwEEAPrwOLC9Fis/ZmoP");
+                byte[] b = Convert.FromBase64String("KLUv/SCszQMAkgcZG2Br21TYk8Z3HS1k8ZLjBAB5UEwvy2EgQ2C0coD3HkKQoc16WzkQi65hFYoqPwjpxn4QwjyvXbBDt2apu2x3eW1dfpIEU0JEAioMBPllVP+kfGP555tQ5mUCvbRZMevz2zz6LgYAM4nGafQmCZYiH5s2BnipKA==");
+                string dir = Path.Combine(Path.GetTempPath(), "cum-dsh-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    Pricing.EnsureLoaded();
+                    string path = Path.Combine(dir, "session.v4.jsonl.zstd");
+                    DateTime now = LogReader.FromMillis(1790833294366 + 3600000.0);
+                    Func<LogIndex, LogIndex> scan = idx => LogReader.Scan(idx, new[] { path }, info => info.FullName.ToLowerInvariant(), now, HarnessLogs.Read);
+                    File.WriteAllBytes(path, a.Concat(b.Take(b.Length - 4)).ToArray()); // the third frame is still being written
+                    LogIndex index = scan(null);
+                    List<HourUsage> first = index.Entries();
+                    Require(first.Count == 1 && first[0].Model == "deepseek-v4-pro" && first[0].Input == 1000 && first[0].Cached == 500 && first[0].Output == 100 && first[0].Cost > 0);
+                    Require(first[0].TimedRequests == 1 && Math.Abs(first[0].TimedSeconds - 2) < 1e-9 && index.Files[0].Offset == a.Length && index.Files[0].Model == "deepseek-flash");
+                    File.WriteAllBytes(path, a.Concat(b).ToArray());
+                    index = scan(index);
+                    Require(index.Entries().Count == 2 && index.Entries().Any(h => h.Model == "deepseek-flash" && h.Input == 300 && h.Output == 20 && h.TimedRequests == 0));
+                    index.Files[0].Offset = 0; index.Files[0].Length = 0; index = scan(index);  // read again from the start
+                    Require(Math.Abs(index.Entries().Sum(h => h.Tokens) - 1920) < 1e-9);
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("English interface: whole strings, built-up strings, placeholders, and back to Chinese", () => {
+                try {
+                    I18n.Use("zh");
+                    Require(I18n.T("近 30 天") == "近 30 天");
+                    I18n.Use("en");
+                    Require(I18n.T("近 30 天") == "Last 30 days" && I18n.T("{0} 分钟", 5) == "5 min" && I18n.T("Codex") == "Codex");
+                    Require(I18n.T("4 / 6" + " 已连接 · 每 " + 5 + " 分钟刷新") == "4 / 6 connected · every 5 min");
+                    Require(I18n.T("Sonnet · 每周") == "Sonnet · Weekly");
+                    // Every placeholder of a key is kept in its English text.
+                    foreach (var pair in I18nTable.En) foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(pair.Key, @"\{\d\}")) Require(pair.Value.Contains(m.Value));
+                    // I18n.Localize 的就地翻译（含 Run 的混合段落）依赖 DependencyObject，属 UI 层；
+                    // 无头测试不构建控件树，这里验证 T() 表本身：
+                    Require(I18n.T("近 7 天") == "Last 7 days" && I18n.T("刷新全部") == "Refresh all" && I18n.T("每周 ") == "Weekly " && I18n.T(" 剩余") == " left");
+                    I18n.Use("zh"); Require(I18n.T("近 7 天") == "近 7 天" && I18n.T("刷新全部") == "刷新全部");
+                } finally { I18n.Use("zh"); }
+            });
+            test("Per-platform refresh: own interval, faster while in use, never under a minute", () => {
+                var config = new AppConfig { RefreshMinutes = 5, FastInUse = true, InUseMinutes = 2 };
+                config.ProviderMinutes["kimi"] = 30;
+                Require(Pacing.Minutes(config, "codex", false) == 5 && Pacing.Minutes(config, "codex", true) == 2);
+                Require(Pacing.Minutes(config, "kimi", false) == 30 && Pacing.Minutes(config, "kimi", true) == 2);
+                config.FastInUse = false; Require(Pacing.Minutes(config, "codex", true) == 5);
+                config.InUseMinutes = 0; config.FastInUse = true; Require(Pacing.Minutes(config, "codex", true) == 1);
+                DateTime now = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                Require(Pacing.Due(DateTime.MinValue, 5, now) && Pacing.Due(now.AddMinutes(-5), 5, now) && Pacing.Due(now.AddSeconds(-290), 5, now) && !Pacing.Due(now.AddMinutes(-4), 5, now));
+                // Windows 用反斜杠路径，Unix 的 Path.GetFileName 不按 \ 分隔，按平台给同构路径。
+                bool windowsPath = OperatingSystem.IsWindows();
+                string claudeWork = windowsPath ? @"C:\u\.claude\projects\p\s.jsonl" : "/Users/u/.claude/projects/p/s.jsonl";
+                string cursorConfig = windowsPath ? @"C:\u\Cursor\User\globalStorage\storage.json" : "/Users/u/Cursor/User/globalStorage/storage.json";
+                string cursorState = windowsPath ? @"C:\u\Cursor\User\globalStorage\state.vscdb-wal" : "/Users/u/Cursor/User/globalStorage/state.vscdb-wal";
+                Require(Pacing.CountsAsWork("claude", claudeWork) && !Pacing.CountsAsWork("cursor", cursorConfig));
+                // Phase 0.3 收紧：state.vscdb-wal 侧车不再是工作量（主库文件仍是）。
+                string cursorMain = windowsPath ? @"C:\u\Cursor\User\globalStorage\state.vscdb" : "/Users/u/Cursor/User/globalStorage/state.vscdb";
+                Require(!Pacing.CountsAsWork("cursor", cursorState) && Pacing.CountsAsWork("cursor", cursorMain));
+            });
+            test("Phase 0.3: WAL/SHM sidecars and our own data directory never count as work", () => {
+                // ZCode 的 db.sqlite 是 WAL 库：只读打开也可能重写 -shm/-wal（WAL 恢复/首个连接
+                // 场景），放行会形成“事件→扫描→侧车写入→事件”死循环。侧车变化总伴随主库文件
+                // 本身的事件，排除不漏工作量（本机实测见 verification/phase0/shm-measurement.txt）。
+                bool windowsPath = OperatingSystem.IsWindows();
+                Func<string, string> side = name => windowsPath ? @"C:\u\.zcode\cli\db\" + name : "/Users/u/.zcode/cli/db/" + name;
+                Require(!Pacing.CountsAsWork("zcode", side("db.sqlite-wal")) && !Pacing.CountsAsWork("zcode", side("db.sqlite-shm")));
+                Require(Pacing.CountsAsWork("zcode", side("db.sqlite")));
+                // 本程序自己的数据目录（便携模式或 CODEUSAGEMONIT_DATA 指进监视根时）排除。
+                Require(!Pacing.CountsAsWork("claude", Path.Combine(Store.Data, "history.json")));
+                Require(!Pacing.CountsAsWork("zcode", Path.Combine(Store.Data, "zcode-logs.json")));
+            });
+            test("Phase 0.1: scheduler debounces a write burst into one directed scan", () => {
+                DateTime t = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                var fired = new List<ScanRequest>();
+                var s = new ScanScheduler(() => t, r => fired.Add(r));
+                s.Report("claude"); s.OnTimer();                                  // 事件刚到：静默未满，不触发
+                Require(fired.Count == 0);
+                t += TimeSpan.FromSeconds(1); s.Report("claude"); s.OnTimer();    // 重臂：距最后事件 1s，仍不触发
+                Require(fired.Count == 0);
+                t += TimeSpan.FromSeconds(1.5); s.OnTimer();                      // 静默 1.5s → 触发一次定向扫描
+                Require(fired.Count == 1 && !fired[0].Full && fired[0].Agents.SequenceEqual(new[] { "claude" }));
+                t += TimeSpan.FromSeconds(1); s.OnTimer();                        // 无新事件不重复触发
+                Require(fired.Count == 1 && s.IsRunning);                         // fire 后进入运行态（单飞）……
+                s.NotifyScanCompleted(false);                                     // ……完成通知解除
+                Require(!s.IsRunning);
+            });
+            test("Phase 0.1: monotonic deadline fires while writes never pause; scan time not counted", () => {
+                DateTime t = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                var fired = new List<ScanRequest>();
+                var s = new ScanScheduler(() => t, r => fired.Add(r));
+                for (int i = 0; i < 5; i++) { s.Report("codex"); t += TimeSpan.FromSeconds(1); s.OnTimer(); }
+                Require(fired.Count == 1);                                        // 每 1s 写入、静默永不满：首事件 +5s 强制触发
+                for (int i = 0; i < 10; i++) { s.Report("codex"); t += TimeSpan.FromSeconds(1); s.OnTimer(); }
+                Require(fired.Count == 1 && s.IsRunning);                         // 扫描执行期不计时：期间不触发
+                s.NotifyScanCompleted(false);
+                t += TimeSpan.FromSeconds(0.2); s.OnTimer();
+                Require(fired.Count == 2 && !fired[1].Full && fired[1].Agents.SequenceEqual(new[] { "codex" }));  // 积压事件按 deadline 续跑
+            });
+            test("Phase 0.1: single flight merges platforms; completion drains the pending scope", () => {
+                DateTime t = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                var fired = new List<ScanRequest>();
+                var s = new ScanScheduler(() => t, r => fired.Add(r));
+                s.Report("claude"); t += TimeSpan.FromSeconds(1.5); s.OnTimer();  // 第 1 轮：{claude}
+                Require(fired.Count == 1 && fired[0].Agents.SequenceEqual(new[] { "claude" }) && s.IsRunning);
+                s.Report("codex"); s.Report("zcode"); s.Report("zcode");          // 进行中只合并范围（并集去重）
+                t += TimeSpan.FromSeconds(5); s.OnTimer();
+                Require(fired.Count == 1);                                        // 单飞：不排队新扫描
+                s.NotifyScanCompleted(false);
+                t += TimeSpan.FromSeconds(1.6); s.OnTimer();                      // 结束后立即以合并范围续跑
+                Require(fired.Count == 2 && !fired[1].Full && fired[1].Agents.OrderBy(a => a, StringComparer.Ordinal).SequenceEqual(new[] { "codex", "zcode" }));
+            });
+            test("Phase 0.1: unattributed events make the scan full, the flag is sticky, failure forces full", () => {
+                DateTime t = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                var fired = new List<ScanRequest>();
+                var s = new ScanScheduler(() => t, r => fired.Add(r));
+                s.Report(null);                                                   // 归因不到任何平台 → 全量
+                t += TimeSpan.FromSeconds(1.5); s.OnTimer();
+                Require(fired.Count == 1 && fired[0].Full);
+                s.Report(null); s.Report("claude");                               // 运行中：又一次全量事件 + 平台事件
+                Require(s.PendingFull);                                           // 平台事件不撤销 fullScan 标记（不撤销）
+                s.NotifyScanCompleted(false);
+                t += TimeSpan.FromSeconds(1.6); s.OnTimer();
+                Require(fired.Count == 2 && fired[1].Full);                       // 续跑仍是全量（标记被这次启动消费）
+                Require(!s.PendingFull);
+                s.NotifyScanCompleted(false);
+                t += TimeSpan.FromSeconds(1.6); s.OnTimer();
+                Require(fired.Count == 2);                                        // 无未处理事件不再触发
+                s.Report("codex"); t += TimeSpan.FromSeconds(1.5); s.OnTimer();
+                Require(fired.Count == 3 && !fired[2].Full && fired[2].Agents.SequenceEqual(new[] { "codex" }));  // 消费后恢复定向
+                s.NotifyScanCompleted(true);                                      // 扫描失败 → 下一次走全量
+                Require(s.PendingFull);
+                s.Report("kimi"); t += TimeSpan.FromSeconds(1.5); s.OnTimer();
+                Require(fired.Count == 4 && fired[3].Full);
+                s.NotifyScanCompleted(false);
+            });
+            test("Phase 0.1: MarkFullScan upgrades the next scan without firing one", () => {
+                DateTime t = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                var fired = new List<ScanRequest>();
+                var s = new ScanScheduler(() => t, r => fired.Add(r));
+                s.MarkFullScan(); s.OnTimer();
+                Require(fired.Count == 0);                                        // 只有标记、无事件：不主动触发（30s tick 兜底）
+                s.Report("pi"); t += TimeSpan.FromSeconds(1.5); s.OnTimer();
+                Require(fired.Count == 1 && fired[0].Full && fired[0].Agents.SequenceEqual(new[] { "pi" }));
+            });
+            test("Phase 0.1: events attribute to the platform whose scan root contains them", () => {
+                // 与真实监视根同源（Pacing.ActivityFolders），对环境变量与 home 的具体取值不敏感。
+                string zcode = Pacing.ActivityFolders("zcode").First();
+                Require(ScanAttribution.AgentFor(Path.Combine(zcode, "cli", "db", "db.sqlite")) == "zcode");
+                Require(ScanAttribution.AgentFor(Path.Combine(zcode, "unrelated", "x.jsonl")) == "zcode");
+                string claude = Pacing.ActivityFolders("claude").First();
+                Require(ScanAttribution.AgentFor(Path.Combine(claude, "proj", "session.jsonl")) == "claude");
+                // 兄弟目录不吃前缀：前缀带分隔符结尾，~/.zcode 不匹配 ~/.zcode-sibling。
+                Require(ScanAttribution.AgentFor(Path.Combine(zcode + "-sibling", "x.jsonl")) == null);
+                Require(ScanAttribution.AgentFor("") == null);
+                Require(ScanAttribution.AgentFor(null) == null);
+            });
+            test("SQL reader handles quotes, comments and several rows per INSERT", () => {
+                var rows = Devices.Inserts("-- note; with a semicolon\nINSERT INTO cum_devices VALUES ('a''b', 'n;x', NULL, '1'); /* x; */ INSERT INTO t (p, q) VALUES (1, 'x'), (2.5e1, 'y');").ToList();
+                Require(rows.Count == 3 && rows[0].Key == "cum_devices" && (string)rows[0].Value["device_id"] == "a'b" && (string)rows[0].Value["name"] == "n;x" && rows[0].Value["exported_utc"] == null);
+                Require(rows[2].Key == "t" && (double)rows[2].Value["p"] == 25 && (string)rows[2].Value["q"] == "y");
+            });
+            test("Backups hold settings and indexes but not keys; restore and pruning", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-backup-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    Directory.CreateDirectory(Path.Combine(dir, "devices"));
+                    File.WriteAllText(Path.Combine(dir, "settings.json"), "{}"); File.WriteAllText(Path.Combine(dir, "codex-logs.json"), "{\"Version\":5}");
+                    File.WriteAllText(Path.Combine(dir, "deepseek.key"), "secret"); File.WriteAllText(Path.Combine(dir, "device.json"), "{}"); File.WriteAllText(Path.Combine(dir, "devices", "x1.json"), "{}");
+                    var config = new AppConfig { BackupKeep = 2 }; DateTime now = DateTime.UtcNow;
+                    string zip = Backups.Create(config, true, now);
+                    using (var archive = System.IO.Compression.ZipFile.OpenRead(zip)) {
+                        var names = archive.Entries.Select(e => e.FullName).OrderBy(n => n, StringComparer.Ordinal).ToList();
+                        // Phase 4.5a：device.json 随备份走——恢复后设备 id 不变，同一台机器
+                        // 不会以新 id 重传全量造成双计。
+                        Require(names.SequenceEqual(new[] { "backup.json", "codex-logs.json", "device.json", "devices/x1.json", "settings.json" }));
+                    }
+                    for (int i = 1; i <= 3; i++) Backups.Create(config, true, now.AddSeconds(i));
+                    Backups.Create(config, false, now.AddSeconds(9));
+                    Require(Backups.Prune(config) == 2 && Backups.List(config).Count(x => x.Auto) == 2 && Backups.List(config).Count(x => !x.Auto) == 1);
+                    File.WriteAllText(Path.Combine(dir, "settings.json"), "{\"RefreshMinutes\":9}");
+                    Backups.Restore(config, Backups.List(config).First(x => x.Auto).Path, now.AddSeconds(20));
+                    Require(File.ReadAllText(Path.Combine(dir, "settings.json")) == "{}" && File.ReadAllText(Path.Combine(dir, "deepseek.key")) == "secret");
+                    Require(Backups.Included("devices/a.json") && !Backups.Included("devices/a/b.json") && !Backups.Included("../settings.json") && !Backups.Included("deepseek.key") && Backups.Included("device.json"));
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("WebDAV listing keeps only device files directly in the folder", () => {
+                string xml = "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\">" +
+                    "<d:response><d:href>/dav/cum/devices/</d:href></d:response><d:response><d:href>/dav/cum/devices/abc123.sql</d:href></d:response>" +
+                    "<d:response><d:href>/dav/cum/devices/sub/</d:href></d:response><d:response><d:href>/dav/cum/devices/notes.txt</d:href></d:response>" +
+                    "<d:response><d:href>https://dav.example.com/dav/cum/devices/def456.sql</d:href></d:response><d:response><d:href>/dav/cum/devices/%E4%B8%AD.sql</d:href></d:response></d:multistatus>";
+                Require(WebDavSync.Files(xml, "https://dav.example.com/dav/cum/devices/").SequenceEqual(new[] { "abc123.sql", "def456.sql" }));
+                Require(WebDavSync.Validate("http://dav.example.com/x") != null && WebDavSync.Validate("http://192.168.1.5/dav") == null && WebDavSync.Validate("https://u:p@dav.example.com/") != null);
+                // review #11：响应体按累计字节上限流式截断，而不是先整体缓冲再检查；
+                // 分片切在多字节字符中间也要正确解码。
+                byte[] payload = System.Text.Encoding.UTF8.GetBytes("设备,abc,中文测试");
+                using (var stream = new MemoryStream(payload))
+                    Require(WebDavSync.ReadCapped(stream, payload.Length, new System.Threading.CancellationTokenSource(), 3).GetAwaiter().GetResult() == "设备,abc,中文测试");
+                using (var stream = new MemoryStream(payload))
+                    Require(WebDavSync.ReadCapped(stream, payload.Length - 1, new System.Threading.CancellationTokenSource(), 5).GetAwaiter().GetResult() == null);   // 超限中止
+                using (var stream = new MemoryStream(new byte[0]))
+                    Require(WebDavSync.ReadCapped(stream, 10, new System.Threading.CancellationTokenSource(), 4).GetAwaiter().GetResult() == "");
+                // 列表条数上限：只取前 MaxDevices 个设备文件。
+                var entries = new System.Text.StringBuilder("<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/dav/devices/</d:href></d:response>");
+                for (int i = 0; i < WebDavSync.MaxDevices + 10; i++) entries.Append("<d:response><d:href>/dav/devices/dev").Append(i).Append(".sql</d:href></d:response>");
+                entries.Append("</d:multistatus>");
+                Require(WebDavSync.Files(entries.ToString(), "https://dav.example.com/dav/devices/").Count == WebDavSync.MaxDevices);
+            });
+            test("Update check compares versions numerically", () => {
+                Require(Updates.Compare("v1.10.0", "1.9.2") > 0 && Updates.Compare("1.3", "1.3.0") == 0 && Updates.Compare("1.2.0", "1.3.0") < 0 && Updates.Compare("1.3.0-beta", "1.3.0") == 0);
+            });
+            test("A truncated log is read again from the start and its surviving records count", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "codeusagemonit-trunc-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    string path = Path.Combine(dir, "rollout.jsonl"); DateTime now = DateTime.UtcNow, at = now.AddHours(-1);
+                    Func<int, int, string> count = (sec, total) => "{\"timestamp\":\"" + at.AddSeconds(sec).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":" + total + ",\"output_tokens\":0},\"last_token_usage\":{\"input_tokens\":200,\"output_tokens\":0}}}}";
+                    Func<LogIndex, LogIndex> scan = idx => LogReader.Scan(idx, new[] { path }, info => info.Name, now, (i, st, p, s, off) => CodexLogs.Read(i, st, p, s, off));
+                    File.WriteAllText(path, count(0, 200) + "\n" + count(10, 400) + "\n" + count(20, 600) + "\n");
+                    LogIndex index = scan(null);
+                    Require(Math.Abs(index.Entries().Sum(h => h.Tokens) - 600) < 1e-9);
+                    // 600 tokens in three records → one 200-token record survives.
+                    File.WriteAllText(path, count(0, 200) + "\n"); File.SetLastWriteTimeUtc(path, now.AddMinutes(-1));
+                    index = scan(index);
+                    Require(Math.Abs(index.Entries().Sum(h => h.Tokens) - 200) < 1e-9);
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("A same-length or longer log rewrite is re-read, a plain append still resumes", () => {
+                // review #10：同长度改写（mtime 更新）时，旧实现从旧 EOF 继续读不到内容却
+                // 保存新 stamp，旧用量滞留；现在按已读前缀指纹识别改写并整体重扫。
+                // 计入的量取自 last_token_usage，所以改写同时改变它（100→900，报告场景）。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-samelen-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    string path = Path.Combine(dir, "rollout.jsonl"); DateTime now = DateTime.UtcNow, at = now.AddHours(-1);
+                    Func<int, int, int, string> count = (sec, total, last) => "{\"timestamp\":\"" + at.AddSeconds(sec).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":" + total + ",\"output_tokens\":0},\"last_token_usage\":{\"input_tokens\":" + last + ",\"output_tokens\":0}}}}";
+                    Func<LogIndex, LogIndex> scan = idx => LogReader.Scan(idx, new[] { path }, info => info.Name, now, (i, st, p, s, off) => CodexLogs.Read(i, st, p, s, off));
+                    Func<LogIndex, double> total = idx => idx.Entries().Sum(e => e.Tokens);
+                    File.WriteAllText(path, count(0, 200, 100) + "\n");
+                    LogIndex index = scan(null);
+                    Require(Math.Abs(total(index) - 100) < 1e-9 && index.Files[0].Head.Length > 0 && index.Files[0].Offset == index.Files[0].Length);
+                    // 同长度改写（字节长度与上面完全相同）：长度不变、mtime 更新——重扫出 900。
+                    File.WriteAllText(path, count(0, 900, 900) + "\n"); File.SetLastWriteTimeUtc(path, now.AddMinutes(-1));
+                    index = scan(index);
+                    Require(Math.Abs(total(index) - 900) < 1e-9);
+                    // 更长的改写：结果只反映新内容，不与旧用量叠加。
+                    File.WriteAllText(path, count(0, 200, 100) + "\n" + count(10, 400, 200) + "\n"); File.SetLastWriteTimeUtc(path, now.AddMinutes(-1));
+                    index = scan(index);
+                    Require(Math.Abs(total(index) - 300) < 1e-9);
+                    // 正常追加不受影响：既有前缀原样，新行增量读取。
+                    File.AppendAllText(path, count(20, 600, 200) + "\n");
+                    index = scan(index);
+                    Require(Math.Abs(total(index) - 500) < 1e-9);
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Cursor dashboard events fold into hourly buckets per model, once each", () => {
+                var index = new LogIndex { CoveredFrom = "2026-09-01T00:00:00Z" }; var file = new LogFile { Name = "cursor-dashboard" }; index.Files.Add(file);
+                object page = J.Serializer().DeserializeObject("{\"totalUsageEventsCount\":3,\"usageEventsDisplay\":[" +
+                    "{\"timestamp\":\"1790000000000\",\"model\":\"claude-x\",\"kind\":\"USAGE_EVENT_KIND_USAGE_BASED\",\"tokenUsage\":{\"inputTokens\":100,\"outputTokens\":20,\"cacheReadTokens\":300,\"cacheWriteTokens\":5,\"totalCents\":12.5}}," +
+                    "{\"timestamp\":\"1790000060000\",\"model\":\"default\",\"tokenUsage\":{\"inputTokens\":10,\"outputTokens\":1}}," +
+                    "{\"timestamp\":\"1790000120000\",\"model\":\"claude-x\",\"kind\":\"USAGE_EVENT_KIND_INCLUDED_IN_PRO\"}]}");
+                List<object> events = CursorUsage.Events(page).ToList();
+                Require(events.Count == 3);
+                foreach (object e in events) CursorUsage.Add(index, file, e);
+                foreach (object e in events) CursorUsage.Add(index, file, e); // a re-fetched page counts once
+                List<HourUsage> hours = index.Entries().ToList();
+                HourUsage x = hours.Single(h => h.Model == "claude-x"), auto = hours.Single(h => h.Model == "auto");
+                Require(x.Hour == new DateTime(2026, 9, 21, 14, 0, 0, DateTimeKind.Utc) && x.Endpoint == null);
+                Require(x.Requests == 2 && x.Input == 100 && x.Output == 20 && x.Cached == 300 && x.CacheWrite == 5 && Math.Abs(x.Cost - .125) < 1e-9);
+                Require(auto.Requests == 1 && auto.Tokens == 11);
+                Require(CursorUsage.Body(new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 9, 2, 0, 0, 0, DateTimeKind.Utc), 2).Contains("\"startDate\":\"1788220800000\""));
+            });
+            test("Cursor parks the completion cursor at the last read event when the page cap stops the scan", () => {
+                // review #14：100 条 × 200 页达上限时旧实现仍把游标推进到 now，更早未读事件
+                // 永久漏计。现在只有区间完整扫描才推进；达上限停在最后读到的事件，下次续传。
+                DateTime now = new DateTime(2026, 10, 8, 12, 0, 0, DateTimeKind.Utc), from = now.AddDays(-31);
+                DateTime last = now.AddHours(-5);
+                Require(CursorUsage.CursorStamp(true, LogReader.Millis(last), from, now) == now.Ticks);          // 完整扫描：照常推进
+                Require(CursorUsage.CursorStamp(false, LogReader.Millis(last), from, now) == last.Ticks);        // 达上限：停在最后读到的事件
+                Require(CursorUsage.CursorStamp(false, null, from, now) == from.Ticks);                          // 没读到事件：保守停在起点
+                Require(CursorUsage.CursorStamp(false, LogReader.Millis(from.AddHours(-1)), from, now) == from.Ticks);   // 夹回区间下界
+                Require(CursorUsage.CursorStamp(false, LogReader.Millis(now.AddMinutes(5)), from, now) == now.Ticks);    // 夹回区间上界
+            });
+            test("Exact window clips hour buckets by overlap, tokens and cost alike", () => {
+                var zone = TimeZones.Find("China Standard Time");
+                var index = new LogIndex { CoveredFrom = "2026-09-01T00:00:00Z", Updated = "2026-09-29T10:00:00Z" };
+                // The window opens at 02:30Z, halfway through the 02:00Z bucket.
+                index.Files.Add(new LogFile { Name = "a.jsonl", Hours = { { "2026092702|openai|m", new Bucket { I = 1000, D = 1 } }, { "2026092703|openai|m", new Bucket { I = 2000, D = 2 } }, { "2026092802|openai|m", new Bucket { I = 4000, D = 8 } } } });
+                var q = new Quota { WindowSeconds = 604800, ResetUtc = "2026-10-04T02:30:00Z" };
+                var usage = UsageDetails.Window(new DayUsage[0], q, new DateTime(2026, 9, 29, 0, 0, 0, DateTimeKind.Utc), 0, index, zone);
+                Require(usage.Exact && Math.Abs(usage.Tokens - 6500) < .001 && Math.Abs(usage.Cost - 10.5) < 1e-9 && usage.CostComplete);
+                Require(!UsageDetails.Window(new DayUsage[0], q, new DateTime(2026, 9, 29, 0, 0, 0, DateTimeKind.Utc), 4, index, zone).Exact);
+            });
+            test("Copilot maps percent_remaining, skips placeholders and unlimited pools", () => {
+                var s = Parsers.Copilot(J.Parse("{\"copilot_plan\":\"individual_pro\",\"quota_reset_date\":\"2026-10-01\",\"quota_snapshots\":{\"premium_interactions\":{\"entitlement\":300,\"remaining\":120,\"percent_remaining\":40,\"unlimited\":false},\"chat\":{\"unlimited\":true},\"completions\":{\"entitlement\":0,\"remaining\":0,\"percent_remaining\":0}}}"));
+                Require(s.Quotas.Count == 1 && s.Quotas[0].Label == "高级请求" && s.Quotas[0].Remaining == 40 && s.Quotas[0].ResetUtc.StartsWith("2026-10-01") && s.Quotas[0].WindowSeconds > 2000000 && s.Plan == "Copilot Individual Pro");
+                var derived = Parsers.Copilot(J.Parse("{\"quota_snapshots\":{\"premium_interactions\":{\"entitlement\":50,\"remaining\":10}}}"));
+                Require(derived.Quotas.Count == 1 && Math.Abs(derived.Quotas[0].Remaining - 20) < 1e-9);
+            });
+            test("Kimi prefers ratio pools and falls back to counts and rate-limit windows", () => {
+                var s = Parsers.Kimi(J.Parse("{\"user\":{\"membership\":{\"level\":\"LEVEL_BASIC\"}},\"usages\":{\"limit_7d\":{\"used_ratio\":0.25,\"reset_time\":\"2026-10-03T00:00:00Z\"}},\"usage\":{\"limit\":\"2048\",\"used\":\"214\"},\"limits\":[{\"window\":{\"duration\":300,\"timeUnit\":\"TIME_UNIT_MINUTE\"},\"detail\":{\"limit\":\"200\",\"used\":\"139\",\"resetTime\":\"2026-10-01T05:00:00Z\"}}]}"));
+                Require(s.Plan == "Kimi Moderato" && s.Quotas.Count == 2 && s.Quotas.First(q => q.Label == "每周").Used == 25 && Math.Abs(s.Quotas.First(q => q.Label == "5 小时").Used - 69.5) < 1e-9);
+                var legacy = Parsers.Kimi(J.Parse("{\"usage\":{\"limit\":\"2048\",\"remaining\":\"1834\",\"resetTime\":\"2026-10-03T00:00:00Z\"}}"));
+                Require(legacy.Quotas.Count == 1 && Math.Abs(legacy.Quotas[0].Used - 214.0 / 2048 * 100) < 1e-9 && legacy.Quotas[0].WindowSeconds == 604800);
+            });
+            test("OpenCode Go reads percent aliases and relative resets", () => {
+                var now = new DateTime(2026, 9, 29, 0, 0, 0, DateTimeKind.Utc);
+                var s = Parsers.OpenCode(J.Parse("{\"usage\":{\"rolling\":{\"percent\":12.5,\"resetInSec\":3600},\"weekly\":{\"usagePercent\":40,\"resetAt\":\"2026-10-03T00:00:00Z\"},\"monthly\":null}}"), now);
+                Require(s.Quotas.Count == 2 && s.Quotas[0].Used == 12.5 && s.Quotas[0].ResetUtc.StartsWith("2026-09-29T01:00") && s.Quotas[1].Used == 40);
+                bool threw = false; try { Parsers.OpenCode(J.Parse("{\"usage\":{}}"), now); } catch (ProviderException) { threw = true; } Require(threw);
+            });
+            test("GLM Coding Plan (ZCode) maps units, counts and the MCP allowance", () => {
+                var s = Parsers.Zai(J.Parse("{\"success\":true,\"code\":200,\"data\":{\"planName\":\"Pro\",\"limits\":[{\"type\":\"TOKENS_LIMIT\",\"unit\":3,\"number\":5,\"percentage\":10,\"usage\":1000,\"currentValue\":300,\"remaining\":700,\"nextResetTime\":1790675446000},{\"type\":\"TOKENS_LIMIT\",\"unit\":6,\"number\":1,\"percentage\":7},{\"type\":\"TIME_LIMIT\",\"unit\":5,\"number\":1,\"percentage\":2},{\"type\":\"OTHER\",\"unit\":1,\"number\":1,\"percentage\":50}]}}"));
+                Require(s.Plan == "GLM Pro" && s.Quotas.Count == 3 && s.Quotas[0].Label == "5 小时" && s.Quotas[0].Used == 30 && s.Quotas[0].WindowSeconds == 18000 && s.Quotas[0].ResetUtc.StartsWith("2026-09-29"));
+                Require(s.Quotas[1].Label == "每周" && s.Quotas[1].Used == 7 && s.Quotas[2].Label.StartsWith("MCP") && s.Quotas[2].WindowSeconds == 0);
+                bool threw = false; try { Parsers.Zai(J.Parse("{\"success\":false,\"msg\":\"token invalid\"}")); } catch (ProviderException) { threw = true; } Require(threw);
+            });
+            test("ZCode local credentials.json: AES-256-GCM import of the last :api-key entry", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-zcred-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    string secret = "self-test-secret";
+                    // 与 ZCode 客户端相同的封套：enc:v1:<b64url(iv)>.<b64url(tag)>.<b64url(ct)>。
+                    Func<string, string> seal = plain => {
+                        byte[] iv = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+                        byte[] plainBytes = System.Text.Encoding.UTF8.GetBytes(plain), cipher = new byte[plainBytes.Length], tag = new byte[16];
+                        using (var gcm = new System.Security.Cryptography.AesGcm(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(secret)), 16)) gcm.Encrypt(iv, plainBytes, cipher, tag);
+                        Func<byte[], string> b64 = data => System.Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+                        return "enc:v1:" + b64(iv) + "." + b64(tag) + "." + b64(cipher);
+                    };
+                    string path = Path.Combine(dir, "credentials.json");
+                    // 多账号取排序后的最后一个 ":api-key" 键；非 api-key 键忽略。
+                    File.WriteAllText(path, "{\"oauth:bigmodel:access_token\":\"" + seal("not-a-key") + "\",\"account-provider:plan:account:1:api-key\":\"" + seal("key-older") + "\",\"account-provider:plan:account:2:api-key\":\"" + seal("key-newer") + "\"}");
+                    Require(LocalCliCredentials.ZCodeApiKey(path, secret) == "key-newer");
+                    // 明文值（无 enc:v1: 前缀）原样采用并去除首尾空白；空值跳过。
+                    File.WriteAllText(path, "{\"x:api-key\":\" plain-key \",\"y:api-key\":\"\"}");
+                    Require(LocalCliCredentials.ZCodeApiKey(path, secret) == "plain-key");
+                    // 密钥不匹配、密文残缺、IV 长度非法都静默回空串，绝不抛出。
+                    File.WriteAllText(path, "{\"x:api-key\":\"" + seal("key") + "\"}");
+                    Require(LocalCliCredentials.ZCodeApiKey(path, "wrong-secret") == "");
+                    File.WriteAllText(path, "{\"x:api-key\":\"enc:v1:AA.EE.BB\"}");
+                    Require(LocalCliCredentials.ZCodeApiKey(path, secret) == "");
+                    string shortIv = System.Convert.ToBase64String(new byte[11]).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+                    File.WriteAllText(path, "{\"x:api-key\":\"enc:v1:" + shortIv + ".AAAAAAAAAAAAAAAAAAAAAA.AAAA\"}");
+                    Require(LocalCliCredentials.ZCodeApiKey(path, secret) == "");
+                    // 回退串格式与客户端逐字符一致。
+                    Require(LocalCliCredentials.FallbackSecret("darwin", "/Users/u", "u") == "zcode-credential-fallback:darwin:/Users/u:u");
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Kimi local config.toml: api_key read only from the managed kimi-code table", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-kimicfg-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    string path = Path.Combine(dir, "config.toml");
+                    File.WriteAllText(path, "[thinking]\nmode = \"on\"\n\n[providers.\"managed:other\"]\napi_key = \"wrong-key\"\n\n[providers.\"managed:kimi-code\"]\nbase_url = \"https://api.kimi.com\"\napi_key = \"good-key\"\napi_key_v2 = \"not-api-key\"\n# api_key = \"commented\"\n\n[providers.\"Xiaomi Token Plan\"]\napi_key = \"also-wrong\"\n");
+                    Require(LocalCliCredentials.KimiApiKey(path) == "good-key");
+                    // 缺文件、缺表、表内没有 api_key 都静默回空串。
+                    Require(LocalCliCredentials.KimiApiKey(Path.Combine(dir, "missing.toml")) == "");
+                    File.WriteAllText(path, "[providers.\"managed:kimi-code\"]\nbase_url = \"https://api.kimi.com\"\n");
+                    Require(LocalCliCredentials.KimiApiKey(path) == "");
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Kimi OAuth credentials: unexpired token used directly, never refreshed or persisted", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-kimioauth-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    DateTime now = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                    long epoch = (long)(now - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                    string path = Path.Combine(dir, "kimi-code.json");
+                    LocalCliCredentials.KimiTokenPoster boom = (u, b) => throw new InvalidOperationException("不应发起刷新请求");
+                    var persisted = new List<string[]>();
+                    // expires_at 缺省：直接用，不刷新。
+                    File.WriteAllText(path, "{\"access_token\":\" tok-direct \",\"custom_extra\":{\"nested\":true}}");
+                    var creds = LocalCliCredentials.LoadKimiOAuthCredentials(path);
+                    Require(creds != null && creds.AccessToken == "tok-direct" && !creds.ExpiresAt.HasValue && !LocalCliCredentials.KimiNeedsRefresh(creds, epoch));
+                    Require(LocalCliCredentials.KimiImport(Path.Combine(dir, "config.toml"), path, now, boom, (i, k) => persisted.Add(new[] { i, k })) == "tok-direct");
+                    Require(persisted.Count == 0); // OAuth 是短寿命凭据：绝不写进钥匙串
+                    // 30s 余量边界：+31 不刷新，+30 刷新；无 access_token 的文件不算凭据。
+                    File.WriteAllText(path, "{\"access_token\":\"t\",\"expires_at\":" + (epoch + 31) + "}");
+                    Require(!LocalCliCredentials.KimiNeedsRefresh(LocalCliCredentials.LoadKimiOAuthCredentials(path), epoch));
+                    File.WriteAllText(path, "{\"access_token\":\"t\",\"expires_at\":" + (epoch + 30) + "}");
+                    Require(LocalCliCredentials.KimiNeedsRefresh(LocalCliCredentials.LoadKimiOAuthCredentials(path), epoch));
+                    File.WriteAllText(path, "{\"refresh_token\":\"rt\"}");
+                    Require(LocalCliCredentials.LoadKimiOAuthCredentials(path) == null && LocalCliCredentials.KimiOAuthToken(path, now, boom) == "");
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Kimi OAuth refresh: posts the client grant, rotates the file, keeps unknown keys at 0600, never persists", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-kimirefresh-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    DateTime now = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                    long epoch = (long)(now - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                    string path = Path.Combine(dir, "credentials", "kimi-code.json"); Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    File.WriteAllText(path, "{\"access_token\":\"tok-old\",\"refresh_token\":\"rt old/abc+~\",\"expires_at\":" + (epoch - 100) + ",\"scope\":\"old-scope\",\"custom_extra\":{\"nested\":true}}");
+                    string seenUrl = null, seenBody = null; var persisted = new List<string[]>();
+                    string token = LocalCliCredentials.KimiImport(Path.Combine(dir, "config.toml"), path, now, (url, body) => {
+                        seenUrl = url; seenBody = body;
+                        return new LocalCliCredentials.KimiTokenReply { Status = 200, Body = "{\"access_token\":\"tok-new\",\"refresh_token\":\"rt-rotated\",\"expires_in\":3600,\"token_type\":\"Bearer\",\"scope\":\"profile v1\"}" };
+                    }, (i, k) => persisted.Add(new[] { i, k }));
+                    Require(token == "tok-new" && persisted.Count == 0); // 刷新得到的也是短寿命凭据：不持久化
+                    Require(seenUrl == LocalCliCredentials.KimiOAuthTokenUrl);
+                    Require(seenBody == "client_id=" + LocalCliCredentials.KimiOAuthClientId + "&grant_type=refresh_token&refresh_token=rt%20old%2Fabc%2B~");
+                    object saved = J.Parse(File.ReadAllText(path));
+                    Require(J.Str(saved, "access_token") == "tok-new" && J.Str(saved, "refresh_token") == "rt-rotated" && J.Str(saved, "token_type") == "Bearer" && J.Str(saved, "scope") == "profile v1");
+                    Require(Math.Abs((J.Num(saved, "expires_at") ?? 0) - (epoch + 3600)) < 0.5);
+                    var extra = J.Get(saved, "custom_extra") as IDictionary<string, object>; // 原文件的未知键原样保留
+                    Require(extra != null && extra["nested"] is bool && (bool)extra["nested"]);
+                    if (!OperatingSystem.IsWindows()) Require(new FileInfo(path).UnixFileMode == (System.IO.UnixFileMode.UserRead | System.IO.UnixFileMode.UserWrite));
+                    Require(!File.Exists(path + LocalCliCredentials.KimiWriteBackTempSuffix)); // 原子写不留临时文件
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Kimi OAuth failures stay silent: no refresh token, 400/401/500, network error, empty access", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-kimifail-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    DateTime now = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                    long epoch = (long)(now - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                    string path = Path.Combine(dir, "kimi-code.json");
+                    File.WriteAllText(path, "{\"access_token\":\"tok-old\",\"refresh_token\":\"rt-old\",\"expires_at\":" + (epoch - 100) + "}");
+                    string before = File.ReadAllText(path);
+                    Func<LocalCliCredentials.KimiTokenReply, string> run = reply => LocalCliCredentials.KimiRefreshToken(LocalCliCredentials.LoadKimiOAuthCredentials(path), path, now, (u, b) => reply);
+                    // 400/401 = 登录态失效；500、空 access_token、网络错误（poster 抛出）同样静默回空。
+                    foreach (LocalCliCredentials.KimiTokenReply reply in new[] {
+                        new LocalCliCredentials.KimiTokenReply { Status = 400, Body = "{\"error\":\"invalid_grant\"}" },
+                        new LocalCliCredentials.KimiTokenReply { Status = 401, Body = "{\"error\":\"invalid_client\"}" },
+                        new LocalCliCredentials.KimiTokenReply { Status = 500, Body = "oops" },
+                        new LocalCliCredentials.KimiTokenReply { Status = 200, Body = "{\"access_token\":\"\"}" },
+                        new LocalCliCredentials.KimiTokenReply { Status = 200, Body = "{}" } }) {
+                        Require(run(reply) == "" && File.ReadAllText(path) == before); // 失败不回写凭据文件
+                    }
+                    Require(LocalCliCredentials.KimiRefreshToken(LocalCliCredentials.LoadKimiOAuthCredentials(path), path, now, (u, b) => throw new InvalidOperationException("网络错误")) == "");
+                    // 无 refresh_token：直接回空，不发请求（回走「请填写 API Key」提示路径）。
+                    File.WriteAllText(path, "{\"access_token\":\"tok-old\",\"expires_at\":" + (epoch - 100) + "}");
+                    LocalCliCredentials.KimiTokenPoster boom = (u, b) => throw new InvalidOperationException("不应发起刷新请求");
+                    Require(LocalCliCredentials.KimiOAuthToken(path, now, boom) == "");
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Kimi refresh with an absurd expires_in skips the expires_at write-back instead of overflowing", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-kimiexp-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    DateTime now = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                    long epoch = (long)(now - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                    string path = Path.Combine(dir, "kimi-code.json");
+                    File.WriteAllText(path, "{\"access_token\":\"tok-old\",\"refresh_token\":\"rt-old\",\"expires_at\":" + (epoch - 100) + "}");
+                    string token = LocalCliCredentials.KimiRefreshToken(LocalCliCredentials.LoadKimiOAuthCredentials(path), path, now, (u, b) => new LocalCliCredentials.KimiTokenReply { Status = 200, Body = "{\"access_token\":\"tok-new\",\"refresh_token\":\"rt-rotated\",\"expires_in\":1e300}" });
+                    Require(token == "tok-new");
+                    object saved = J.Parse(File.ReadAllText(path));
+                    Require(J.Str(saved, "access_token") == "tok-new" && J.Str(saved, "refresh_token") == "rt-rotated");
+                    Require(Math.Abs((J.Num(saved, "expires_at") ?? 0) - (epoch - 100)) < 0.5); // expires_at 保持旧值，不溢出
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Kimi import chain: inline api_key wins over OAuth and is the only persisted path", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-kimichain-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    DateTime now = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+                    long epoch = (long)(now - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                    string config = Path.Combine(dir, "config.toml"), creds = Path.Combine(dir, "kimi-code.json");
+                    File.WriteAllText(creds, "{\"access_token\":\"tok-oauth\",\"refresh_token\":\"rt\",\"expires_at\":" + (epoch + 3600) + "}");
+                    var persisted = new List<string[]>();
+                    LocalCliCredentials.KimiTokenPoster boom = (u, b) => throw new InvalidOperationException("api_key 优先时不应读 OAuth");
+                    // 内联 api_key 非空：直接采用并持久化，不碰 OAuth。
+                    File.WriteAllText(config, "[providers.\"managed:kimi-code\"]\napi_key = \"inline-key\"\n");
+                    Require(LocalCliCredentials.KimiImport(config, creds, now, boom, (i, k) => persisted.Add(new[] { i, k })) == "inline-key");
+                    Require(persisted.Count == 1 && persisted[0][0] == "kimi" && persisted[0][1] == "inline-key");
+                    // api_key 为空串（本机实测形态）：落到 OAuth，且不持久化。
+                    File.WriteAllText(config, "[providers.\"managed:kimi-code\"]\napi_key = \"\"\n");
+                    Require(LocalCliCredentials.KimiImport(config, creds, now, boom, (i, k) => persisted.Add(new[] { i, k })) == "tok-oauth");
+                    Require(persisted.Count == 1);
+                    // 无 api_key 且 token 过期：刷新后返回新 token，仍不持久化。
+                    File.WriteAllText(config, "[thinking]\nmode = \"on\"\n");
+                    File.WriteAllText(creds, "{\"access_token\":\"tok-old\",\"refresh_token\":\"rt\",\"expires_at\":" + (epoch - 100) + "}");
+                    Require(LocalCliCredentials.KimiImport(config, creds, now, (u, b) => new LocalCliCredentials.KimiTokenReply { Status = 200, Body = "{\"access_token\":\"tok-fresh\",\"expires_in\":3600}" }, (i, k) => persisted.Add(new[] { i, k })) == "tok-fresh");
+                    Require(persisted.Count == 1);
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Local CLI credential import stays silent when nothing is importable", () => {
+                string missing = Path.Combine(Path.GetTempPath(), "cum-absent-" + Guid.NewGuid().ToString("N"), "credentials.json");
+                Require(LocalCliCredentials.ZCodeApiKey(missing, "secret") == "" && LocalCliCredentials.KimiApiKey(missing) == "");
+                // JSON 里没有 api-key 键：同样静默，Fetch 走原有的「请填写 API Key」提示路径。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-absent-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    string path = Path.Combine(dir, "credentials.json"); File.WriteAllText(path, "{\"oauth:bigmodel:access_token\":\"x\"}");
+                    Require(LocalCliCredentials.ZCodeApiKey(path, "secret") == "");
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+                Require(LocalCliCredentials.Import("not-a-provider") == "");
+            });
+            test("Custom provider definitions are validated before any request", () => {
+                var p = CustomProviders.Parse("{\"name\":\"My Gateway\",\"url\":\"https://api.example.com/usage\",\"auth\":\"bearer\",\"windows\":[{\"label\":\"每日\",\"used\":\"d.used\",\"limit\":\"d.limit\"}]}");
+                Require(p.Id == "custom-my-gateway" && p.Host == "api.example.com" && p.Windows.Count == 1);
+                Func<string, bool> rejected = json => { try { CustomProviders.Parse(json); return false; } catch (ArgumentException) { return true; } };
+                Require(rejected("{\"name\":\"x\",\"url\":\"http://api.example.com/u\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"p\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://user:pw@api.example.com/u\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"p\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://a.example.com\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"p\",\"remainingPercent\":\"q\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://a.example.com\",\"windows\":[{\"label\":\"a\",\"used\":\"u\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://a.example.com\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"a..b\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://a.example.com\",\"auth\":\"header\",\"header\":\"Cookie\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"p\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://a.example.com\",\"script\":\"x\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"p\"}]}"));
+                Require(rejected("{\"name\":\"x\",\"url\":\"https://a.example.com\"}"));
+                Require(!rejected("{\"name\":\"lan\",\"url\":\"http://192.168.1.20:3000/api/usage\",\"windows\":[{\"label\":\"a\",\"usedPercent\":\"p\"}]}") && !rejected("{\"name\":\"loop\",\"url\":\"http://127.0.0.1:8080/u\",\"balance\":{\"amount\":\"b\"}}"));
+            });
+            test("Custom provider mapping: paths, ratios, counts, resets and missing fields", () => {
+                var p = CustomProviders.Parse("{\"name\":\"g\",\"url\":\"https://a.example.com\",\"plan\":\"data.plan\",\"windows\":[{\"label\":\"日\",\"used\":\"data.items[1].used\",\"limit\":\"data.items[1].limit\",\"resetInSeconds\":\"data.reset\",\"windowHours\":24},{\"label\":\"月\",\"remainingPercent\":\"data.left\",\"ratio\":true,\"resetsAt\":\"data.month_end\"},{\"label\":\"缺\",\"usedPercent\":\"data.nope\"}],\"balance\":{\"amount\":\"data.balance\",\"currencyPath\":\"data.cur\"}}");
+                var now = new DateTime(2026, 9, 29, 0, 0, 0, DateTimeKind.Utc);
+                var s = CustomProviders.Map(p, J.Parse("{\"data\":{\"plan\":\"Team\",\"items\":[{\"used\":1},{\"used\":\"30\",\"limit\":120}],\"reset\":7200,\"left\":0.8,\"month_end\":1790675446,\"balance\":\"12.5\",\"cur\":\"cny\"}}"), now);
+                Require(s.Plan == "Team" && s.Quotas.Count == 2 && s.Quotas[0].Used == 25 && s.Quotas[0].ResetUtc.StartsWith("2026-09-29T02:00") && s.Quotas[0].WindowSeconds == 86400);
+                Require(Math.Abs(s.Quotas[1].Used - 20) < 1e-9 && s.Quotas[1].ResetUtc.StartsWith("2026-09-29") && s.Balances.Count == 1 && s.Balances[0].Currency == "CNY" && s.Balances[0].Amount == 12.5);
+                bool threw = false; try { CustomProviders.Map(p, J.Parse("{\"other\":1}"), now); } catch (ProviderException) { threw = true; } Require(threw);
+                Require(CustomProviders.Resolve(J.Parse("{\"a\":[{\"b\":5}]}"), "a[0].b").ToString() == "5" && CustomProviders.Resolve(J.Parse("{\"a\":[]}"), "a[3].b") == null);
+            });
+            test("Epoch milliseconds are recognised as timestamps", () => {
+                Require(J.Iso(1790675446000.0).StartsWith("2026-09-29") && J.Iso(1790675446).StartsWith("2026-09-29"));
+            });
+            test("Quota cache entries round-trip through the serializer", () => {
+                var state = new ProviderState { Id = "codex", Status = "ready" }; state.Quotas.Add(new Quota { Label = "每周", Used = 47, WindowSeconds = 604800, ResetUtc = "2026-10-04T02:33:45Z" });
+                var back = J.Serializer().Deserialize<List<ProviderState>>(J.Serializer().Serialize(new List<ProviderState> { state }));
+                Require(back.Count == 1 && back[0].Quotas[0].Remaining == 53 && back[0].Quotas[0].Label == "每周");
+            });
+            test("Unpriced local usage remains unknown instead of becoming a zero-dollar claim", () => {
+                var idx = new LogIndex(); idx.Files.Add(new LogFile { Hours = { { "2026010102||x", new Bucket { I = 15, R = 1, U = 15 } } } });
+                var h = HistoryService.FromIndexes(new Dictionary<string, LogIndex> { { "codex", idx } }, TimeZoneInfo.Utc, new DateTime(2026, 1, 1), 30);
+                Require(h.Days.Count == 1 && !h.Days[0].CostKnown && h.Days[0].UnpricedTokens == 15);
+            });
+            test("Most-used model is ordered by recorded tokens including cache", () => {
+                var day = new DayUsage { Day = "2026-01-01", Agent = "codex", Models = { new ModelUsage { Model = "test-a", Tokens = 91 }, new ModelUsage { Model = "test-b", Tokens = 10 } } };
+                Require(UsageDetails.MainModel(new[] { day }) == "test-a");
+            });
+            test("Window migration turns off legacy always-on-top and preserves provider selection", () => {
+                var config = new AppConfig { UiVersion = 0, PinWindow = true, AlwaysOnTop = true, Enabled = new[] { "codex" } };
+                WindowFrameRules.Normalize(config); Require(!config.AlwaysOnTop && config.UiVersion == 2 && config.Enabled.Length == 1);
+                config.WindowWidth = 560; WindowFrameRules.Normalize(config); Require(config.WindowWidth == 560);
+            });
+            test("Window geometry and zoom reject nonfinite values", () => {
+                var config = new AppConfig { UiVersion = 2, WindowWidth = Double.NaN, WindowHeight = -10, UiScale = Double.PositiveInfinity, WindowLeft = Double.NaN };
+                WindowFrameRules.Normalize(config); Require(config.WindowWidth == 420 && config.WindowHeight == 460 && config.UiScale == 1 && !config.WindowLeft.HasValue);
+            });
+            test("Display sizes: solid material becomes opaque acrylic, unknown sizes fall back to full", () => {
+                var config = new AppConfig { UiVersion = 2, Material = "solid", SurfaceOpacity = .3, DisplaySize = "huge", CompactProvider = "" };
+                WindowFrameRules.Normalize(config); Require(config.Material == "acrylic" && config.SurfaceOpacity == 1 && config.DisplaySize == "full" && config.CompactProvider == "overview");
+                config.SurfaceOpacity = Double.NaN; WindowFrameRules.Normalize(config); Require(config.SurfaceOpacity == WindowFrameRules.DefaultOpacity);
+            });
+            test("Surface colour: hex parsing, HSV round trip, contrast, invalid config falls back", () => {
+                // WPF 的 System.Windows.Media.Color 换成 Core 里的轻量 Color 结构（ColorMath 同源实现）。
+                Color c;
+                Require(ColorMath.TryParseHex("#0f1b2d", out c) && ColorMath.Hex(c) == "#0F1B2D");
+                Require(ColorMath.TryParseHex("abc", out c) && ColorMath.Hex(c) == "#AABBCC");
+                Require(!ColorMath.TryParseHex("#12345", out c) && !ColorMath.TryParseHex("red", out c) && !ColorMath.TryParseHex(null, out c));
+                foreach (string hex in new[] { "#15171B", "#000000", "#FFFFFF", "#2A1218", "#0D2226", "#7F3FBF" }) {
+                    double h, s, v; ColorMath.TryParseHex(hex, out c); ColorMath.ToHsv(c, out h, out s, out v);
+                    Require(ColorMath.Hex(ColorMath.FromHsv(h, s, v)) == hex);
+                }
+                Require(ColorMath.Hex(ColorMath.FromHsv(360, 1, 1)) == "#FF0000" && ColorMath.Hex(ColorMath.FromHsv(120, 1, 1)) == "#00FF00");
+                Require(Math.Abs(ColorMath.ContrastRatio(Color.White, Color.Black) - 21) < 1e-9);
+                Require(ColorMath.ContrastRatio(Color.FromRgb(0xF2, 0xF3, 0xF5), WindowFrameRules.DefaultTint) > 15);
+                var config = new AppConfig { UiVersion = 2, SurfaceColor = "not a colour" };
+                WindowFrameRules.Normalize(config); Require(config.SurfaceColor == "#15171B");
+                config.SurfaceColor = "#abc"; WindowFrameRules.Normalize(config); Require(config.SurfaceColor == "#AABBCC");
+            });
+            test("Per-size geometry keeps valid compact layouts and drops broken ones", () => {
+                var config = new AppConfig { UiVersion = 2 };
+                config.Layouts["small"] = new WindowGeometry { Width = 200, Height = 200, Left = Double.NaN, Top = 40 };
+                config.Layouts["full"] = new WindowGeometry { Width = 400, Height = 400 };
+                config.Layouts["large"] = new WindowGeometry { Width = Double.PositiveInfinity, Height = 400 };
+                WindowFrameRules.Normalize(config);
+                Require(config.Layouts.Count == 1 && !config.Layouts["small"].Left.HasValue && config.Layouts["small"].Top == 40);
+                config.Layouts = null; WindowFrameRules.Normalize(config); Require(config.Layouts != null);
+            });
+            test("Every display size's default fits between its resize limits", () => {
+                foreach (string size in new[] { "small", "medium", "large", "full", "edge" }) {
+                    Size min = WindowFrameRules.MinSize(size), def = WindowFrameRules.DefaultSize(size), max = WindowFrameRules.MaxSize(size);
+                    Require(min.Width <= def.Width && def.Width <= max.Width && min.Height <= def.Height && def.Height <= max.Height);
+                }
+                Require(WindowFrameRules.DefaultSize("edge").Width == 84);   // 窄条保持窄
+            });
+            test("Grok turns: per-model usage, cached input split out, recorded cost wins, event ids dedupe", () => {
+                string line = "{\"timestamp\":1750000000,\"params\":{\"sessionId\":\"sess-1\",\"update\":{\"sessionUpdate\":\"turn_completed\",\"usage\":{\"modelUsage\":{\"grok-4.5-build\":{\"inputTokens\":100,\"outputTokens\":20,\"cachedReadTokens\":40,\"reasoningTokens\":10,\"costUsdTicks\":12345678901}}}},\"_meta\":{\"eventId\":\"evt-1\"}}}";
+                var index = new LogIndex(); var file = new LogFile();
+                AgentLogs.GrokLine(index, file, line, "s", null); AgentLogs.GrokLine(index, file, line, "s", null);
+                Bucket b = file.Hours["2025061515||grok-4.5-build"];
+                Require(b.I == 60 && b.C == 40 && b.O == 20 && b.R == 1 && Math.Abs(b.D - 1.2345678901) < 1e-12);
+            });
+            test("Kimi wire records: old StatusUpdate and new turn-scoped usage.record", () => {
+                var index = new LogIndex(); var file = new LogFile();
+                AgentLogs.KimiLine(index, file, "{\"timestamp\":1770983427.123,\"message\":{\"type\":\"StatusUpdate\",\"payload\":{\"token_usage\":{\"input_other\":100,\"output\":50,\"input_cache_read\":10,\"input_cache_creation\":20},\"message_id\":\"msg-1\"}}}", "kimi-for-coding", "s", DateTime.UtcNow);
+                AgentLogs.KimiLine(index, file, "{\"type\":\"usage.record\",\"model\":\"kimi-code/kimi-for-coding\",\"usage\":{\"inputOther\":3064,\"output\":76,\"inputCacheRead\":14848,\"inputCacheCreation\":0},\"usageScope\":\"turn\",\"time\":1782113184943}", "x", "s", DateTime.UtcNow);
+                AgentLogs.KimiLine(index, file, "{\"type\":\"usage.record\",\"model\":\"kimi-code/kimi-for-coding\",\"usage\":{\"inputOther\":5000,\"output\":200},\"usageScope\":\"session\",\"time\":1782113185000}", "x", "s", DateTime.UtcNow);
+                Bucket old = file.Hours["2026021311||kimi-for-coding"];
+                Require(old.I == 100 && old.O == 50 && old.C == 10 && old.W == 20 && file.Hours.Count == 2 && file.Hours.Values.Sum(v => v.R) == 2);
+            });
+            test("Pi assistant messages: a total-only record becomes output, copies count once", () => {
+                var index = new LogIndex(); var file = new LogFile();
+                string line = "{\"type\":\"message\",\"timestamp\":\"2026-01-02T00:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5\",\"usage\":{\"totalTokens\":333}}}";
+                MoreAgentLogs.PiLine(index, file, line); MoreAgentLogs.PiLine(index, file, line);
+                Bucket b = file.Hours["2026010200||gpt-5"]; Require(b.O == 333 && b.R == 1);
+            });
+            // ── D 期 Sessions 会话账本：记账 / 去重 / Reset 回扣 / 损坏隔离 / 裁剪 ──
+            test("Session ledger books deduplicated events per session and model with first/last stamps", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-sessions-book-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);   // 隔离：Begin 只读这里，绝不碰真实数据目录
+                try {
+                    var index = new LogIndex(); var file = new LogFile();
+                    string line = "{\"timestamp\":1750000000,\"params\":{\"sessionId\":\"sess-1\",\"update\":{\"sessionUpdate\":\"turn_completed\",\"usage\":{\"modelUsage\":{\"grok-4.5-build\":{\"inputTokens\":100,\"outputTokens\":20,\"cachedReadTokens\":40,\"costUsdTicks\":12345678901}}}},\"_meta\":{\"eventId\":\"evt-1\"}}}";
+                    SessionLedger ledger = SessionLedger.Begin("grok");
+                    AgentLogs.GrokLine(index, file, line, "s", null);
+                    AgentLogs.GrokLine(index, file, line, "s", null);   // 同一事件重复：主口径去重后才会记账，不双计
+                    string second = line.Replace("evt-1", "evt-2").Replace("grok-4.5-build", "grok-5").Replace("1750000000", "1750000100");
+                    AgentLogs.GrokLine(index, file, second, "s", null);
+                    SessionRow row = ledger.Sessions["sess-1"];
+                    Require(row.Total().R == 2 && row.Models.Count == 2);   // session must aggregate deduped events across models
+                    Require(row.Models["grok-4.5-build"].R == 1 && row.Models["grok-4.5-build"].I == 60 && row.Models["grok-4.5-build"].C == 40);   // per-model amounts must match the hourly bucket口径
+                    Require(String.CompareOrdinal(row.First, row.Last) < 0 && row.First.StartsWith("2025-06-15", StringComparison.Ordinal));   //"first/last stamps must follow the events"
+                    Require(file.Hours.Values.Sum(v => v.R) == 2);   // hourly buckets keep their existing semantics
+                } finally { SessionLedger.End("grok"); Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Session buckets give a rewritten file's claims back on LogReader.Reset (codex path)", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-sessions-reset-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                try {
+                    string path = Path.Combine(dir, "rollout.jsonl"); DateTime now = DateTime.UtcNow, at = now.AddHours(-1);
+                    Func<int, int, string> count = (sec, total) => "{\"timestamp\":\"" + at.AddSeconds(sec).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":" + total + ",\"output_tokens\":0},\"last_token_usage\":{\"input_tokens\":200,\"output_tokens\":0}}}}";
+                    Func<LogIndex, LogIndex> scan = idx => LogReader.Scan(idx, new[] { path }, info => info.Name, now, (i, st, p, s, off) => CodexLogs.Read(i, st, p, s, off));
+                    File.WriteAllText(path, count(0, 200) + "\n" + count(10, 400) + "\n" + count(20, 600) + "\n");
+                    SessionLedger ledger = SessionLedger.Begin("codex");
+                    LogIndex index = scan(null);
+                    string session = "file:rollout.jsonl";   // meta id 缺失时按文件名归属，前后轮一致
+                    Require(ledger.Sessions[session].Total().R == 3);   // three deduped events must book three session requests
+                    Require(Math.Abs(index.Entries().Sum(h => h.Tokens) - 600) < 1e-9);
+                    // 截断改写 → LogReader.Reset：会话桶与小时桶同步回扣，重读后两边都只剩 1 笔。
+                    File.WriteAllText(path, count(0, 200) + "\n"); File.SetLastWriteTimeUtc(path, now.AddMinutes(-1));
+                    index = scan(index);
+                    Require(ledger.Sessions[session].Total().R == 1);   // Reset must give the rewritten file's session claims back
+                    Require(Math.Abs(index.Entries().Sum(h => h.Tokens) - 200) < 1e-9);   // hourly totals must stay in step with the session ledger
+                    // 公共 GiveBack 通道：整文件回扣后该会话行清空移除。
+                    SessionLedger.GiveBack("rollout.jsonl");
+                    Require(!ledger.Sessions.ContainsKey(session));   //"GiveBack must empty the owner file's sessions"
+                } finally { SessionLedger.End("codex"); Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("A pricing version bump quarantines the session ledger so the full re-read does not double count", () => {
+                // 价目表更新 → Pricing.Version 变化 → LogReader.Fresh 丢弃整个主索引并全量重读
+                //（不走 Reset）。账本随 Pricing.Version 盖戳：戳不符必须隔离旧 claims 并经
+                // BackfillDue 全量重建，否则重读事件在旧桶上再记一遍，会话 R 翻倍且无自愈。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-sessions-pricing-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                try {
+                    string path = Path.Combine(dir, "rollout.jsonl"); DateTime now = DateTime.UtcNow, at = now.AddHours(-1);
+                    Func<int, int, string> count = (sec, total) => "{\"timestamp\":\"" + at.AddSeconds(sec).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") + "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":" + total + ",\"output_tokens\":0},\"last_token_usage\":{\"input_tokens\":200,\"output_tokens\":0}}}}";
+                    Func<LogIndex, LogIndex> scan = idx => LogReader.Scan(idx, new[] { path }, info => info.Name, now, (i, st, p, s, off) => CodexLogs.Read(i, st, p, s, off));
+                    File.WriteAllText(path, count(0, 200) + "\n" + count(10, 400) + "\n" + count(20, 600) + "\n");
+                    SessionLedger ledger = SessionLedger.Begin("codex");
+                    LogIndex index = scan(null);
+                    string session = "file:rollout.jsonl";
+                    SessionLedger.SaveIfActive("codex", now);   // 与 UsageScanner.Persist 同序：盖戳落盘
+                    Require(ledger.Sessions[session].Total().R == 3);   // first pass books three deduped events
+                    // 模拟价目表换版：把已落盘账本的戳改成旧值（等价于 Pricing.Version 前进）。
+                    SessionLedger persisted = SessionLedger.Load("codex");
+                    persisted.PricingStamp = "stale-pricing-version";
+                    Store.Write(SessionLedger.FileOf("codex"), persisted);
+                    SessionLedger.End("codex");
+                    // 换版后的第一轮：账本戳不符 → 旧 claims 隔离（不复用）→ 解锁 backfill 全量重建。
+                    SessionLedger rebuilt = SessionLedger.Begin("codex");
+                    Require(rebuilt.Sessions.Count == 0);   // a stale pricing stamp must not reuse old claims
+                    Require(SessionLedger.BackfillDue("codex"));   // quarantine must re-arm the backfill
+                    if (SessionLedger.BackfillDue("codex") || true) LogReader.ResetAll(index);   // 生产由扫描器调用
+                    index = scan(index);
+                    Require(rebuilt.Sessions[session].Total().R == 3);   // rebuild must re-book three events, not six (no double counting)
+                    Require(Math.Abs(index.Entries().Sum(h => h.Tokens) - 600) < 1e-9);   // hourly totals stay unchanged across the pricing rebuild
+                } finally { SessionLedger.End("codex"); Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Claude replace rebooks the winning copy in the session ledger without double counting", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-sessions-claude-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                try {
+                    Func<string, string, int, string> line = (rid, id, output) => "{\"type\":\"assistant\",\"timestamp\":\"2026-09-27T02:00:00Z\",\"sessionId\":\"sess-c\",\"requestId\":\"" + rid + "\",\"message\":{\"id\":\"" + id + "\",\"model\":\"demo-claude\",\"usage\":{\"input_tokens\":10,\"output_tokens\":" + output + "}}}";
+                    var index = new LogIndex(); var state = new LogFile { Name = "s.jsonl" }; index.Files.Add(state);
+                    SessionLedger ledger = SessionLedger.Begin("claude");
+                    using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(line("req_a", "msg_1", 5) + "\n"))) ClaudeLogs.Read(index, state, "s.jsonl", stream, 0);
+                    SessionRow row = ledger.Sessions["sess-c"];
+                    Require(row.Total().R == 1 && row.Models["demo-claude"].O == 5);   // first copy books once
+                    // 更大副本（同 message id、新 request id）走替换路径：会话账本同步换账。
+                    using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(line("req_a", "msg_1", 50) + "\n"))) ClaudeLogs.Read(index, state, "s.jsonl", stream, 0);
+                    // 整行回扣会把 SessionRow 对象移除并重建：重新取引用再断言。
+                    row = ledger.Sessions["sess-c"];
+                    Require(row.Total().R == 1 && row.Models["demo-claude"].O == 50);   // the larger copy must replace, not add up
+                    Require(state.Hours.Values.Single().R == 1 && state.Hours.Values.Single().O == 50);   // hourly buckets unchanged by the session rebook
+                    // claim 已换主：整文件回扣后无残留（无双计、无负桶）。
+                    SessionLedger.GiveBack("s.jsonl");
+                    Require(!ledger.Sessions.ContainsKey("sess-c"));   //"give-back must clear the rebooked session"
+                } finally { SessionLedger.End("claude"); Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("A corrupt sessions ledger is quarantined for rebuild; save/load round-trips and trims the 33-day window", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-sessions-store-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                try {
+                    string file = Path.Combine(dir, SessionLedger.FileOf("grok"));
+                    File.WriteAllText(file, "{\"Version\":1,\"Sessions\":not-json");
+                    Require(SessionLedger.Load("grok").Sessions.Count == 0);   // a corrupt ledger must load as empty, never throw
+                    SessionLedger.Begin("grok");
+                    Require(!File.Exists(file));   //"the corrupt file must be quarantined (deleted) on attach"
+                    Require(SessionLedger.BackfillDue("grok"));   //"quarantine must trigger a backfill rebuild on the next scan"
+                    SessionLedger.Emit("grok", new LogFile { Name = "a" }, "k1", "s1", DateTime.UtcNow.AddHours(-1), "m", new Bucket { R = 1, I = 10 });
+                    SessionLedger.SaveIfActive("grok", DateTime.UtcNow);
+                    SessionLedger.End("grok");
+                    Require(SessionLedger.Load("grok").Sessions["s1"].Total().R == 1);   // save/load must round-trip
+                    SessionLedger.Begin("grok");
+                    SessionLedger.Emit("grok", new LogFile { Name = "a" }, "k2", "old", DateTime.UtcNow.AddDays(-40), "m", new Bucket { R = 1, I = 5 });
+                    SessionLedger.SaveIfActive("grok", DateTime.UtcNow);   // Trim 到 RetainDays 窗口
+                    SessionLedger.End("grok");
+                    var kept = SessionLedger.Load("grok").Sessions;
+                    Require(!kept.ContainsKey("old") && kept.ContainsKey("s1"));   // sessions beyond the retention window must be trimmed, recent ones kept
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Antigravity default data roots are legal multi-segment paths on this platform", () => {
+                // 默认根不能写成反斜杠字面量（@".gemini\antigravity" 等）：在 macOS 会被 Path.Combine
+                // 拼成单段路径，目录永远不存在。必须不含 '\'，且与 HOME 组合后是多段合法路径。
+                foreach (string root in AgentLogs.AntigravityDefaultRoots) {
+                    Require(root.Length > 0 && root.IndexOf('\\') < 0);
+                    string combined = Path.Combine(LogReader.Home, root);
+                    Require(combined.IndexOf('\\') < 0);
+                    Require(Path.GetDirectoryName(combined) != null && Path.GetFileName(combined).Length > 0);
+                    string relative = combined.Substring(LogReader.Home.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    Require(relative.Contains('/') && !relative.Contains('\\'));
+                }
+            });
+            test("Antigravity desktop response parses measured model quotas", () => {
+                var state = LocalAntigravity.Parse(J.Parse("{\"userStatus\":{\"cascadeModelConfigData\":{\"clientModelConfigs\":[{\"label\":\"test-model\",\"quotaInfo\":{\"remainingFraction\":0.6,\"resetTime\":\"2026-01-20T00:00:00Z\"}}]}}}")); Require(state.Quotas.Count == 1 && state.Quotas[0].Remaining == 60);
+            });
+            test("Installed copies use the per-user directory; zip copies and portable.txt stay beside the exe", () => {
+                string root = Path.Combine(Path.GetTempPath(), "codeusagemonit-data-" + Guid.NewGuid().ToString("N"));
+                string user = Path.Combine(root, "userdir");
+                Directory.CreateDirectory(root);
+                try {
+                    // Windows: %LOCALAPPDATA%\codeusagemonit；macOS: ~/Library/Application Support/codeusagemonit。
+                    string expectedUserData = OperatingSystem.IsWindows()
+                        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "codeusagemonit")
+                        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "codeusagemonit");
+                    Require(Store.PathsEqual(Store.UserDataDirectory(), expectedUserData));
+                    Require(!Store.PathsEqual(null, root) && !Store.PathsEqual("  ", root));
+                    Require(Store.PathsEqual(root + Path.DirectorySeparatorChar, root));
+                    // Windows 专属断言：盘符根目录（"C:\"）语义在 macOS 上不存在，跳过。
+                    if (OperatingSystem.IsWindows()) Require(Store.NormalizeDirectory("C:\\") == "C:\\");
+                    Require(!Store.TryMigratePortableData(Path.Combine(user, "inside"), user));
+                    string beside = Path.Combine(root, "data");
+                    // macOS 默认落用户目录（.app 包内不可写、GUI/CLI 共用数据）；其余平台默认 exe 旁 data。
+                    string fallback = OperatingSystem.IsMacOS() ? user : beside;
+                    Require(Store.PathsEqual(Store.ResolveData(root, "", null, false, user), fallback));
+                    Require(Store.PathsEqual(Store.ResolveData(root, Path.Combine(root, "other"), null, false, user), fallback));
+                    Require(Store.PathsEqual(Store.ResolveData(root, root + Path.DirectorySeparatorChar, null, false, user), user));
+                    Require(Store.PathsEqual(Store.ResolveData(root, "", null, true, user), user));
+                    Require(Store.PathsEqual(Store.ResolveData(root, "", Path.Combine(root, "override"), true, user), Path.Combine(root, "override")));
+                    File.WriteAllText(Path.Combine(root, "portable.txt"), "portable");
+                    Require(Store.PathsEqual(Store.ResolveData(root, root, Path.Combine(root, "override"), true, user), beside));
+                    File.Delete(Path.Combine(root, "portable.txt"));
+                    Directory.CreateDirectory(beside);
+                    File.WriteAllText(Path.Combine(beside, "settings.json"), "{\"kept\":true}");
+                    Directory.CreateDirectory(Path.Combine(beside, "nested"));
+                    File.WriteAllText(Path.Combine(beside, "nested", "a.txt"), "a");
+                    File.WriteAllText(Path.Combine(root, "installed.txt"), "installed");
+                    string chosen = Store.ChooseDataFor(root, "", null, user);
+                    Require(Store.PathsEqual(chosen, user));
+                    Require(File.ReadAllText(Path.Combine(user, "settings.json")) == "{\"kept\":true}");
+                    Require(File.ReadAllText(Path.Combine(user, "nested", "a.txt")) == "a");
+                    Require(!Directory.Exists(beside));
+                    Directory.CreateDirectory(beside);
+                    File.WriteAllText(Path.Combine(beside, "settings.json"), "{\"new\":true}");
+                    Require(!Store.TryMigratePortableData(beside, user));
+                    Require(File.ReadAllText(Path.Combine(user, "settings.json")) == "{\"kept\":true}");
+                } finally { try { Directory.Delete(root, true); } catch { } }
+            });
+            test("A linked data directory is copied and the link is left in place", () => {
+                // Windows 专属用例（NTFS junction：cmd.exe mklink /J + rmdir）；macOS 无对应机制，跳过。
+                if (!OperatingSystem.IsWindows()) return;
+                string root = Path.Combine(Path.GetTempPath(), "codeusagemonit-link-" + Guid.NewGuid().ToString("N"));
+                string real = Path.Combine(root, "real"); string link = Path.Combine(root, "data"); string user = Path.Combine(root, "user");
+                Directory.CreateDirectory(real);
+                File.WriteAllText(Path.Combine(real, "settings.json"), "{}");
+                Process linkProcess = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + link + "\" \"" + real + "\"") { UseShellExecute = false, CreateNoWindow = true });
+                linkProcess.WaitForExit();
+                Require(linkProcess.ExitCode == 0);
+                try {
+                    Require(Store.TryMigratePortableData(link, user));
+                    Require(File.ReadAllText(Path.Combine(user, "settings.json")) == "{}");
+                    Require(Directory.Exists(link) && File.Exists(Path.Combine(real, "settings.json")));
+                } finally {
+                    try {
+                        Process remove = Process.Start(new ProcessStartInfo("cmd.exe", "/c rmdir \"" + link + "\"") { UseShellExecute = false, CreateNoWindow = true });
+                        if (remove != null) remove.WaitForExit();
+                        Directory.Delete(root, true);
+                    } catch { }
+                }
+            });
+            test("A failed keychain write reports failure and leaves no stale .key reference", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-keyring-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    var seen = new List<string[]>();
+                    Keychain.RunOverride = args => { seen.Add(args); return null; }; // 合成 security 子进程失败，不触碰真实钥匙串
+                    Require(!Store.SetProviderKey("selftest-fail", "selftest-synthetic-key"));
+                    Require(!Store.HasSavedKey("selftest-fail") && Store.SavedKey("selftest-fail") == "");
+                    // Phase 5：默认账户的引用文件是 <id>_default.key；失败绝不写任何引用文件。
+                    Require(!File.Exists(Path.Combine(dir, "selftest-fail.key")) && !File.Exists(Path.Combine(dir, "selftest-fail_default.key")));
+                    Keychain.RunOverride = args => ""; // 合成成功：exit 0、stdout 为空
+                    Require(Store.SetProviderKey("selftest-fail", "selftest-synthetic-key"));
+                    Require(Store.HasSavedKey("selftest-fail"));
+                    Require(File.ReadAllText(Path.Combine(dir, "selftest-fail_default.key")) == "keychain:selftest-fail:default");
+                    Require(seen.Count == 1 && seen[0][0] == "add-generic-password"); // 钥匙串先行，成功才落引用
+                    // 清除（空白即空密钥）恒成功，并删掉引用文件。
+                    Require(Store.SetProviderKey("selftest-fail", "  ") && !Store.HasSavedKey("selftest-fail") && !File.Exists(Path.Combine(dir, "selftest-fail_default.key")));
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Keychain subprocess timeout bounds the whole read and drains both pipes", () => {
+                if (!OperatingSystem.IsMacOS()) return; // /bin/sh 合成命令仅在 macOS 自测执行
+                var watch = Stopwatch.StartNew();
+                string timedOut = Keychain.Execute("/bin/sh", new[] { "-c", "sleep 6; echo too-late" }, 1500);
+                watch.Stop();
+                Require(timedOut == null && watch.ElapsedMilliseconds < 5500); // 旧实现会等满 6 秒以上
+                string both = Keychain.Execute("/bin/sh", new[] { "-c", "echo synthetic-out; echo synthetic-err >&2" }, 4000);
+                Require(both != null && both.Trim() == "synthetic-out"); // stderr 与 stdout 并行读取，互不阻塞
+                string failed = Keychain.Execute("/bin/sh", new[] { "-c", "exit 44" }, 4000);
+                Require(failed == null); // 非 0 退出码（44 = 条目不存在）回 null
+            });
+            test("Keychain service-scoped lookup passes service and account to security; Exists never asks for the value", () => {
+                var seen = new List<string[]>();
+                Keychain.RunOverride = args => { seen.Add(args); return args.Contains("-w") ? "synthetic-json" : ""; }; // 不带 -w 回空串 = exit 0（条目存在）
+                try {
+                    Require(Keychain.GetFromService("Some Service", "someuser") == "synthetic-json");
+                    Require(seen[0][0] == "find-generic-password" && Array.IndexOf(seen[0], "-s") >= 0 && Array.IndexOf(seen[0], "Some Service") >= 0 && Array.IndexOf(seen[0], "-a") >= 0 && Array.IndexOf(seen[0], "someuser") >= 0);
+                    Require(Keychain.Exists("Some Service", "someuser")); // 合成通道对不带 -w 的调用回空串 = exit 0（存在）
+                    Require(seen[1].Length == 5 && !seen[1].Contains("-w")); // 存在性探测不读取密钥值（find-generic-password + -s/-a 四段）
+                    Keychain.RunOverride = args => null; // 模拟 exit 44：条目不存在
+                    Require(Keychain.GetFromService("Some Service", "someuser") == "" && !Keychain.Exists("Some Service", "someuser"));
+                    Require(Keychain.GetFromService("", "u") == "" && Keychain.GetFromService("s", "") == "" && !Keychain.Exists("", ""));
+                } finally { Keychain.RunOverride = null; }
+            });
+            // ── Claude Code 凭据链（钥匙串优先 → 文件兜底）──合成 keychainGet，不触真实钥匙串。
+            test("Claude credentials prefer the keychain and fall back to the file when it is unavailable or unusable", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-claude-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try {
+                    string file = Path.Combine(dir, ".credentials.json");
+                    File.WriteAllText(file, "{\"claudeAiOauth\":{\"accessToken\":\"synthetic-file-token\",\"subscriptionType\":\"max\"}}");
+                    string seenService = null, seenAccount = null;
+                    object fromFile = ClaudeCredentials.Read(file, (service, account) => { seenService = service; seenAccount = account; return null; });
+                    Require(J.Str(fromFile, "claudeAiOauth", "accessToken") == "synthetic-file-token");
+                    Require(seenService == ClaudeCredentials.KeychainService && (seenAccount ?? "").Length > 0);
+                    // 钥匙串可用：直接采用，不读文件。
+                    object fromKeychain = ClaudeCredentials.Read(file, (service, account) => "{\"claudeAiOauth\":{\"accessToken\":\"synthetic-kc-token\"}}");
+                    Require(J.Str(fromKeychain, "claudeAiOauth", "accessToken") == "synthetic-kc-token");
+                    // 钥匙串内容损坏 / 没有 accessToken：回退文件。
+                    object broken = ClaudeCredentials.Read(file, (service, account) => "not json");
+                    Require(J.Str(broken, "claudeAiOauth", "accessToken") == "synthetic-file-token");
+                    object empty = ClaudeCredentials.Read(file, (service, account) => "{\"claudeAiOauth\":{}}");
+                    Require(J.Str(empty, "claudeAiOauth", "accessToken") == "synthetic-file-token");
+                    // 两者都不可用：null（Fetch 走既有 Need → setup 提示）。
+                    Require(ClaudeCredentials.Read(Path.Combine(dir, "missing.json"), (service, account) => null) == null);
+                    Require(ClaudeCredentials.Read(Path.Combine(dir, "missing.json"), null) == null);
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            // ── 概览排序共享口径（ProviderOrder）：完整面板平台卡与紧凑面板 Urgent 共用 ──
+            test("ProviderOrder ranks quota/balance holders first by tightest remaining, then ready without readings, then the rest", () => {
+                Quota q(int remaining) { return new Quota { Label = "窗口", Used = 100 - remaining }; }
+                var tight = new ProviderState { Id = "a", Status = "ready" }; tight.Quotas.Add(q(5));
+                var loose = new ProviderState { Id = "b", Status = "cached" }; loose.Quotas.Add(q(80));
+                var mid = new ProviderState { Id = "c", Status = "ready" }; mid.Quotas.Add(q(40)); mid.Quotas.Add(q(15)); // 取最紧窗口
+                var balanceOnly = new ProviderState { Id = "d", Status = "ready" }; balanceOnly.Balances.Add(new Balance { Currency = "CNY", Amount = 12 });
+                var readyNoData = new ProviderState { Id = "e", Status = "ready" };   // 仅本机用量
+                var setup = new ProviderState { Id = "f", Status = "setup" };
+                var loading = new ProviderState { Id = "g", Status = "loading" };
+                Require(ProviderOrder.Tier(tight) == 0 && ProviderOrder.Tier(balanceOnly) == 0 && ProviderOrder.Tier(loose) == 0);
+                Require(ProviderOrder.Tier(readyNoData) == 1 && ProviderOrder.Tier(null) == 2 && ProviderOrder.Tier(setup) == 2 && ProviderOrder.Tier(loading) == 2);
+                // Tier 0 内部按最紧剩余%升序（a=5 → c=15 → b=80 → d=纯余额无剩余%）；纯余额平台（无剩余%口径）排在额度平台之后。
+                var ordered = new[] { balanceOnly, loading, loose, setup, tight, readyNoData, mid }
+                    .Select(s => (s, ProviderOrder.Tier(s), ProviderOrder.Tightness(s)))
+                    .OrderBy(x => x.Item2).ThenBy(x => x.Item3).Select(x => x.s.Id).ToList();
+                Require(String.Join(",", ordered) == "a,c,b,d,e,g,f");
+                // Cursor 的 Grok Bot 附加行不参与自动挑选；只有它时仍不丢读数。
+                var cursor = new ProviderState { Id = "cursor", Status = "ready" };
+                Parsers.CursorGrokBot(cursor, J.Parse("{\"usagePercent\":90,\"hasNonZeroIncludedLimit\":true}"));
+                cursor.Quotas.Insert(0, q(30));
+                Require(ProviderOrder.MainQuota(cursor).Remaining == 30);
+                var grokOnly = new ProviderState { Id = "cursor", Status = "ready" };
+                Parsers.CursorGrokBot(grokOnly, J.Parse("{\"usagePercent\":90,\"hasNonZeroIncludedLimit\":true}"));
+                Require(ProviderOrder.MainQuota(grokOnly).Remaining == 10 && ProviderOrder.MainQuota(null) == null);
+            });
+            test("LocalCredentialSource describes pi and environment variables without touching the filesystem", () => {
+                Require(LocalCredentialSource.Describe("pi", new AppConfig()) == "本机日志");
+                Environment.SetEnvironmentVariable("DEEPSEEK_API_KEY", "selftest-noncredential");
+                try { Require(LocalCredentialSource.Describe("deepseek", new AppConfig()) == "环境变量"); }
+                finally { Environment.SetEnvironmentVariable("DEEPSEEK_API_KEY", null); }
+            });
+            test("LocalCredentialSource reports a saved key for a custom platform from the data directory only", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-srcprobe-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                ProviderCatalog.Custom["custom-free"] = CustomProviders.Parse("{\"name\":\"无需密钥\",\"url\":\"https://probe.example.com/api\",\"auth\":\"none\",\"balance\":{\"amount\":\"data.balance\",\"currency\":\"USD\"}}");
+                try {
+                    Require(LocalCredentialSource.Describe("custom-probe", new AppConfig()) == "");   // auth 需要 key：未保存 = 未检测到
+                    Require(LocalCredentialSource.Describe("custom-free", new AppConfig()) == "无需密钥"); // auth=none 不需要密钥
+                    Keychain.RunOverride = args => ""; // 合成钥匙串写入成功，不触真实钥匙串
+                    Require(Store.SetProviderKey("custom-probe", "selftest-noncredential"));
+                    Require(LocalCredentialSource.Describe("custom-probe", new AppConfig()) == "已保存密钥");
+                } finally {
+                    ProviderCatalog.Custom.Remove("custom-free");
+                    Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+            // ── ROADMAP Phase 5：每平台多账户（存储键 providerId:accountId + 惰性迁移）──
+            // 合成钥匙串：按 account（= "<providerId>:<accountId>"）存取，绝不触碰真实钥匙串。
+            test("Legacy single-key migrates lazily to the default account and keeps the old entry", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                var items = new Dictionary<string, string>();
+                try {
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    // 旧版形态：data/<id>.key 只存钥匙串引用，密钥在钥匙串 account <id> 下。
+                    File.WriteAllText(Path.Combine(dir, "deepseek.key"), "keychain:deepseek");
+                    items["deepseek"] = "legacy-secret";
+                    Require(Store.SavedKey("deepseek", "default") == "legacy-secret");
+                    // 迁移落点：新引用文件 + 钥匙串新键 <id>:default；旧文件与旧条目原样保留。
+                    Require(File.ReadAllText(Path.Combine(dir, "deepseek_default.key")) == "keychain:deepseek:default");
+                    Require(items["deepseek:default"] == "legacy-secret");
+                    Require(File.Exists(Path.Combine(dir, "deepseek.key")) && items.ContainsKey("deepseek"));
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("The lazy migration is idempotent (the second read uses the new key only)", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                var items = new Dictionary<string, string>(); int sets = 0;
+                try {
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { sets++; items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    File.WriteAllText(Path.Combine(dir, "kimi.key"), "keychain:kimi");
+                    items["kimi"] = "legacy-secret";
+                    Require(Store.SavedKey("kimi", "default") == "legacy-secret");   // 第一次读：迁移
+                    // 迁移后即使旧钥匙串条目消失（模拟旧条目被清理），读取仍走新键。
+                    items.Remove("kimi");
+                    int before = sets;
+                    Require(Store.SavedKey("kimi", "default") == "legacy-secret" && Store.HasSavedKey("kimi", "default"));
+                    Require(sets == before);   // 幂等：不再写钥匙串
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("A failed keychain write during migration keeps the legacy key readable and retries later", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                var items = new Dictionary<string, string>();
+                Func<string[], string> full = args => {
+                    if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                    if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                    if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                    return null;
+                };
+                try {
+                    File.WriteAllText(Path.Combine(dir, "zcode.key"), "keychain:zcode");
+                    items["zcode"] = "legacy-secret";
+                    // 钥匙串写入失败（add 返回 null）：迁移退化为纯读，旧密钥照常可用、无半成品。
+                    Keychain.RunOverride = args => args[0] == "find-generic-password" ? full(args) : null;
+                    Require(Store.SavedKey("zcode", "default") == "legacy-secret");
+                    Require(!File.Exists(Path.Combine(dir, "zcode_default.key")) && !items.ContainsKey("zcode:default"));
+                    // 修复后重试：迁移完成（不丢 key，可无限重试）。
+                    Keychain.RunOverride = full;
+                    Require(Store.SavedKey("zcode", "default") == "legacy-secret");
+                    Require(File.Exists(Path.Combine(dir, "zcode_default.key")) && items["zcode:default"] == "legacy-secret");
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Key reference writes are atomic: no torn files are produced and a torn legacy file still migrates", () => {
+                // review P2-1：引用文件走临时文件 + Replace/Move 覆写，成功路径不落任何 .tmp
+                // 半成品；marker 撕裂的旧引用（只可能来自外部破坏）按旧版布局的固定 account
+                // <id> 直读钥匙串，迁移不会因此被永久跳过。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                var items = new Dictionary<string, string>();
+                try {
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    // 正常保存：引用文件完整，目录里没有遗留临时文件。
+                    Require(Store.SetProviderKey("opencode", "default", "key-one"));
+                    Require(File.ReadAllText(Path.Combine(dir, "opencode_default.key")) == "keychain:opencode:default");
+                    Require(Directory.GetFiles(dir, "*.tmp").Length == 0);
+                    // 撕裂的旧引用文件（"keychain:deepseek" 写到一半）：迁移照常完成。
+                    File.WriteAllText(Path.Combine(dir, "deepseek.key"), "keychai");
+                    items["deepseek"] = "legacy-secret";
+                    Require(Store.SavedKey("deepseek", "default") == "legacy-secret");
+                    Require(File.ReadAllText(Path.Combine(dir, "deepseek_default.key")) == "keychain:deepseek:default");
+                    Require(Directory.GetFiles(dir, "*.tmp").Length == 0);
+                    // 撕裂文件本身保留未动（不删任何旧位置内容）。
+                    Require(File.ReadAllText(Path.Combine(dir, "deepseek.key")) == "keychai");
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("A failed key save keeps the old key so the provider drops out of the refresh plan", () => {
+                // review P2-3：钥匙串不可用时 SetProviderKey 失败、读回的仍是旧密钥——
+                // 保存前后密钥快照不变，PlanCredentialRefresh 不产生 Reset（设置页据此把
+                // 该平台排除在定向刷新之外并亮出错误，而不是拿没存进去的 key 去刷新）。
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                var items = new Dictionary<string, string>();
+                try {
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    Require(Store.SetProviderKey("kimi", "default", "key-one"));
+                    var keysBefore = new Dictionary<string, string> { { "kimi", Store.SavedKey("kimi", "default") } };
+                    // 钥匙串变不可用（add 失败）：新 key 没存进去。
+                    Keychain.RunOverride = args => args[0] == "find-generic-password" ? (items.TryGetValue("kimi:default", out var v) ? v : null) : null;
+                    Require(!Store.SetProviderKey("kimi", "default", "key-two"));
+                    var keysAfter = new Dictionary<string, string> { { "kimi", Store.SavedKey("kimi", "default") } };
+                    Require(keysAfter["kimi"] == "key-one");   // 读回旧值：没有半保存状态
+                    LimitsRuntime.RefreshPlan plan = LimitsRuntime.PlanCredentialRefresh(keysBefore, keysAfter, new string[0], new[] { "kimi" }, new[] { "kimi" });
+                    Require(!plan.Reset.Contains("kimi") && plan.Forget.Count == 0);
+                    // 恢复后重试保存成功（可重试，无半成品文件）。
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    Require(Store.SetProviderKey("kimi", "default", "key-two") && Store.SavedKey("kimi", "default") == "key-two");
+                    Require(Directory.GetFiles(dir, "*.tmp").Length == 0);
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Per-account keys are independent and deleting an account cleans only its key", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                var items = new Dictionary<string, string>();
+                try {
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    Require(Store.SetProviderKey("kimi", "default", "key-one"));
+                    Require(Store.SetProviderKey("kimi", "a2", "key-two"));
+                    Require(Store.SavedKey("kimi", "default") == "key-one" && Store.SavedKey("kimi", "a2") == "key-two");
+                    Require(Store.HasSavedKey("kimi", "default") && Store.HasSavedKey("kimi", "a2") && !Store.HasSavedKey("kimi", "a3"));
+                    // 删除 a2 的密钥：只动 <id>:a2，其他账户原样。
+                    Require(Store.SetProviderKey("kimi", "a2", ""));
+                    Require(!Store.HasSavedKey("kimi", "a2") && !items.ContainsKey("kimi:a2") && !File.Exists(Path.Combine(dir, "kimi_a2.key")));
+                    Require(Store.SavedKey("kimi", "default") == "key-one");
+                    // 清除默认账户时连遗留位置一起清（无“旧条目复活”路径）。
+                    File.WriteAllText(Path.Combine(dir, "kimi.key"), "keychain:kimi");
+                    items["kimi"] = "stale-legacy";
+                    Require(Store.SetProviderKey("kimi", ""));
+                    Require(!File.Exists(Path.Combine(dir, "kimi.key")) && !File.Exists(Path.Combine(dir, "kimi_default.key")) && !items.ContainsKey("kimi") && !items.ContainsKey("kimi:default"));
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("ProviderKey resolves the active account; the environment variable still wins", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string previous = Store.SwapData(dir);
+                string ambient = Environment.GetEnvironmentVariable("OPENCODE_API_KEY");
+                var items = new Dictionary<string, string>();
+                try {
+                    Keychain.RunOverride = args => {
+                        if (args[0] == "find-generic-password") { string value; return items.TryGetValue(args[Array.IndexOf(args, "-a") + 1], out value) ? value : null; }
+                        if (args[0] == "add-generic-password") { items[args[Array.IndexOf(args, "-a") + 1]] = args[Array.IndexOf(args, "-w") + 1]; return ""; }
+                        if (args[0] == "delete-generic-password") return items.Remove(args[Array.IndexOf(args, "-a") + 1]) ? "" : null;
+                        return null;
+                    };
+                    Environment.SetEnvironmentVariable("OPENCODE_API_KEY", null);   // 隔离环境变量
+                    var config = new AppConfig();
+                    Require(Store.SetProviderKey("opencode", "default", "key-one"));
+                    Require(Store.SetProviderKey("opencode", "a1", "key-two"));
+                    Require(Accounts.Add(config, "opencode", "") == "a1");   // 先物化账户结构（id 从现有最大推导）
+                    Require(Accounts.SetActive(config, "opencode", "a1"));
+                    Require(Store.ProviderKey("opencode", config) == "key-two");   // 活动账户的密钥
+                    Require(Accounts.SetActive(config, "opencode", "default"));
+                    Require(Store.ProviderKey("opencode", config) == "key-one");
+                    // 自定义平台同口径：存储键 custom-…:accountId，活动账户缺省 = 默认。
+                    Require(Store.SetProviderKey("custom-gw", "default", "custom-one"));
+                    Require(Store.SavedKey("custom-gw", Accounts.ActiveId(config, "custom-gw")) == "custom-one");
+                    Require(Store.SetProviderKey("custom-gw", "a1", "custom-two"));
+                    Require(Accounts.Add(config, "custom-gw", "") == "a1");
+                    Accounts.SetActive(config, "custom-gw", "a1");
+                    Require(Store.SavedKey("custom-gw", Accounts.ActiveId(config, "custom-gw")) == "custom-two");
+                    // 环境变量优先语义与账户无关（env 覆盖任一活动账户的已保存密钥）。
+                    Environment.SetEnvironmentVariable("OPENCODE_API_KEY", "env-key");
+                    try {
+                        Accounts.SetActive(config, "opencode", "a1");
+                        Require(Store.ProviderKey("opencode", "a1", config) == "env-key" && Store.ProviderKey("opencode", config) == "env-key");
+                    } finally { Environment.SetEnvironmentVariable("OPENCODE_API_KEY", null); }
+                    Require(Store.ProviderKey("opencode", config) == "key-two");
+                } finally { Environment.SetEnvironmentVariable("OPENCODE_API_KEY", ambient); Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Account lists default to one implicit account; ids derive from the max; active falls back after removal", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    Keychain.RunOverride = args => null;   // Remove 内部的密钥清理走合成钥匙串（本用例无密钥可删）
+                    var config = new AppConfig();
+                    Require(Accounts.List(config, "deepseek").Count == 1 && Accounts.List(config, "deepseek")[0].Id == "default");
+                    Require(Accounts.ActiveId(config, "deepseek") == "default");
+                    Require(Accounts.DisplayName(config, "deepseek", "default") == "账户 1");
+                    Require(Accounts.Add(config, "deepseek", "") == "a1");
+                    Require(Accounts.Add(config, "deepseek", "工作号") == "a2");
+                    Require(Accounts.DisplayName(config, "deepseek", "a2") == "工作号");
+                    Require(Accounts.Remove(config, "deepseek", "a2"));
+                    Require(Accounts.Add(config, "deepseek", "") == "a2");   // 编号 = 现有最大 +1；删除已清空旧键，复用无泄漏
+                    Accounts.SetActive(config, "deepseek", "a2");
+                    Require(Accounts.ActiveId(config, "deepseek") == "a2");
+                    Require(Accounts.Remove(config, "deepseek", "a2"));
+                    Require(Accounts.ActiveId(config, "deepseek") == "default");   // 删除活动账户后回落
+                    Require(Accounts.Remove(config, "deepseek", "a1"));
+                    Require(!Accounts.Remove(config, "deepseek", "default"));       // 最后一个账户不可删
+                    Require(!Accounts.SetActive(config, "deepseek", "ghost"));  // 不存在的账户不可激活
+                    // Normalize 修复：Active 悬空回落、重复与非法 id 剔除、空清单补默认。
+                    config.Accounts["broken"] = new ProviderAccounts { Active = "ghost", Items = new List<ProviderAccount> { new ProviderAccount { Id = "default" }, new ProviderAccount { Id = "default" }, new ProviderAccount { Id = "" }, new ProviderAccount { Id = "a1", Name = "保留" } } };
+                    Accounts.Normalize(config);
+                    Require(config.Accounts["broken"].Active == "default" && config.Accounts["broken"].Items.Count == 2);   // 回落到第一个合法账户
+                    config.Accounts["empty"] = new ProviderAccounts();
+                    Accounts.Normalize(config);
+                    Require(config.Accounts["empty"].Items.Count == 1 && config.Accounts["empty"].Active == "default");
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Active-account changes feed the directed refresh plan", () => {
+                var before = new[] { new KeyValuePair<string, string>("deepseek", "default"), new KeyValuePair<string, string>("kimi", "a1") };
+                var after = new[] { new KeyValuePair<string, string>("deepseek", "default"), new KeyValuePair<string, string>("kimi", "a2"), new KeyValuePair<string, string>("opencode", "default") };
+                Require(Accounts.ChangedProviders(before, after).SetEquals(new HashSet<string> { "kimi", "opencode" }));
+                Require(Accounts.ChangedProviders(before, before).Count == 0);
+                Require(Accounts.ChangedProviders(null, after).Count == 3);   // 全新快照：全部视为变化
+            });
+            test("SourceHealth sees a credential only on the active account", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                string ambient = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
+                try {
+                    Keychain.RunOverride = args => args[0] == "add-generic-password" ? "" : (args[0] == "delete-generic-password" ? "" : null);
+                    Environment.SetEnvironmentVariable("DEEPSEEK_API_KEY", null);   // 隔离环境变量（HasCredential 会先查它）
+                    var config = new AppConfig { Enabled = new[] { "deepseek" } };
+                    Store.SetProviderKey("deepseek", "default", "key-one");
+                    Store.SetProviderKey("deepseek", "a2", "key-two");
+                    Require(SourceHealth.HasCredential("deepseek", config));   // 活动账户 default 有密钥
+                    Accounts.SetActive(config, "deepseek", "a2");
+                    Require(SourceHealth.HasCredential("deepseek", config));   // 活动账户 a2 有密钥
+                    string a3 = Accounts.Add(config, "deepseek", "");          // 新账户没有密钥
+                    Accounts.SetActive(config, "deepseek", a3);
+                    Require(!SourceHealth.HasCredential("deepseek", config));
+                    Require(SourceHealth.StateOf("deepseek", config, null, null) == SourceHealth.Unconfigured);
+                } finally { Environment.SetEnvironmentVariable("DEEPSEEK_API_KEY", ambient); Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Refresh channels stay provider-grained: ResetFor is the only account-switch effect", () => {
+                var limits = new LimitsRuntime();
+                DateTime now = new DateTime(2026, 10, 8, 12, 0, 0, DateTimeKind.Utc);
+                var state = new ProviderState { Id = "zcode", Status = "ready" };
+                Parsers.Add(state, "5 小时", 40, null, 18000);
+                limits.RecordSuccess("zcode", state, now);
+                Require(!limits.AutoDue(new AppConfig { RefreshMinutes = 5 }, "zcode", false, now.AddSeconds(10)));
+                limits.ResetFor("zcode");   // 切换活动账户 = 凭据变更：清空唯一通道，立即到期
+                Require(limits.AutoDue(new AppConfig { RefreshMinutes = 5 }, "zcode", false, now.AddSeconds(10)));
+                Require(limits.ChannelOf("zcode").LastAttemptUtc == DateTime.MinValue);   // 不产生第二通道
+            });
+            test("The doctor report builds from a multi-account config without leaking key material", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-accounts-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    Keychain.RunOverride = args => args[0] == "add-generic-password" ? "" : (args[0] == "delete-generic-password" ? "" : null);
+                    var config = new AppConfig { Enabled = new[] { "deepseek", "kimi" } };
+                    config.Accounts["deepseek"] = new ProviderAccounts { Active = "a2", Items = new List<ProviderAccount> { new ProviderAccount { Id = "default" }, new ProviderAccount { Id = "a2", Name = "工作号" } } };
+                    Store.SetProviderKey("deepseek", "a2", "doctor-must-not-leak-this-secret");
+                    Store.Write("quota-cache.json", new List<ProviderState> { new ProviderState { Id = "deepseek", Status = "ready", Message = "已连接" } });
+                    string report = CliProgram.DoctorReport(config);
+                    Require(!report.Contains("doctor-must-not-leak-this-secret") && !report.Contains("keychain:"));
+                    Require(report.Contains("DeepSeek") && report.Contains("Kimi"));   // 健康表按显示名列出全部平台
+                } finally { Keychain.RunOverride = null; Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Launch arguments carry the entry DLL when relaunching through the dotnet host", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-launch-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+                try {
+                    string dotnet = Path.Combine(dir, "dotnet"), dotnetExe = Path.Combine(dir, "dotnet.exe"), app = Path.Combine(dir, "CodeUsageMonit.Desktop.dll"), host = Path.Combine(dir, "codeusagemonit");
+                    foreach (string path in new[] { dotnet, dotnetExe, app, host }) File.WriteAllText(path, "");
+                    // dotnet <app>.dll：LaunchAgent 必须是 [dotnet, app.dll, --background]（旧实现漏掉 DLL）。
+                    Require(AutoStart.LaunchArguments(dotnet, app).SequenceEqual(new[] { dotnet, app, "--background" }));
+                    Require(AutoStart.LaunchArguments(dotnetExe, app).SequenceEqual(new[] { dotnetExe, app, "--background" }));
+                    // apphost：主程序自己即可再启动，入口 DLL 不进参数。
+                    Require(AutoStart.LaunchArguments(host, app).SequenceEqual(new[] { host, "--background" }));
+                    // 入口镜像本身是 DLL 的形态保持既有行为。
+                    Require(AutoStart.LaunchArguments(app, app).SequenceEqual(new[] { "dotnet", app, "--background" }));
+                    // dotnet host 拿不到入口 DLL、主模块不存在：返回失败而不是写无法启动的 plist。
+                    Require(AutoStart.LaunchArguments(dotnet, "") == null && AutoStart.LaunchArguments(dotnet, host) == null);
+                    Require(AutoStart.LaunchArguments(Path.Combine(dir, "missing"), app) == null);
+                } finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("JavaScriptSerializer enforces MaxJsonLength and RecursionLimit on both paths", () => {
+                var limited = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = 8 };
+                bool rejected = false;
+                try { limited.Deserialize<Dictionary<string, object>>("{\"a\":123456789}"); } catch (ArgumentException) { rejected = true; }
+                Require(rejected); // typed 路径：输入超长
+                rejected = false;
+                try { limited.DeserializeObject("{\"a\":123456789}"); } catch (ArgumentException) { rejected = true; }
+                Require(rejected); // object 路径：输入超长
+                rejected = false;
+                try { limited.Serialize(new { label = "输出超过八字" }); } catch (ArgumentException) { rejected = true; }
+                Require(rejected); // 序列化输出超长
+                Require(limited.Serialize(new { a = 1 }) == "{\"a\":1}"); // 限制内照常工作
+                var shallow = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = 4096, RecursionLimit = 2 };
+                rejected = false;
+                try { shallow.DeserializeObject("[[[1]]]"); } catch (ArgumentException) { rejected = true; }
+                Require(rejected); // object 路径：嵌套超过 RecursionLimit
+                rejected = false;
+                try { shallow.Deserialize<Dictionary<string, object>>("{\"a\":{\"b\":{\"c\":1}}}"); } catch (ArgumentException) { rejected = true; }
+                Require(rejected); // typed 路径：嵌套超深
+                Require(shallow.DeserializeObject("[[1]]") is object[] pair && pair.Length == 1); // 深度限制内照常解析
+                // 默认实例（J.Serializer：32MB / 100）不受影响——既有读写全部照旧。
+                Require(J.Serializer().Deserialize<Dictionary<string, object>>("{\"a\":{\"b\":{\"c\":1}}}") != null);
+                Require(J.Serializer().Serialize(new { label = "当前账期" }).Contains("当前账期"));
+            });
+            test("Shell quoting keeps spaces and metacharacters literal for Terminal's shell", () => {
+                // Connect.LaunchCli（review #8）：Terminal do script 的命令先按 POSIX 规则
+                // 逐词 Quote、再 AppleScript 转义。覆盖空格、单引号、双引号、$ 与反引号。
+                Require(Shell.Quote("plain") == "'plain'" && Shell.Quote("") == "''" && Shell.Quote(null) == "''");
+                Require(Shell.Quote("/opt/my tools/claude") == "'/opt/my tools/claude'");
+                Require(Shell.Quote("it's") == "'it'\\''s'"); // 内嵌单引号：'\'' 关闭-转义-重开
+                Require(Shell.Quote("say \"hi\"") == "'say \"hi\"'"); // 双引号在单引号内是字面量
+                Require(Shell.Quote("$HOME `whoami` $(x); rm -rf / |&<>") == "'$HOME `whoami` $(x); rm -rf / |&<>'");
+                // LaunchCli 的两步顺序：先 Quote、后 AppleScript 转义；AppleScript 还原后
+                // 交给 shell 的串必须恰好是 Quote 的产物（反斜杠与双引号按层正确翻倍/还原）。
+                string quoted = Shell.Quote("/a b/c'd\"e$f`g");
+                string appleScriptEscaped = quoted.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                Require(appleScriptEscaped != quoted && appleScriptEscaped.Replace("\\\"", "\"").Replace("\\\\", "\\") == quoted);
+                // macOS：真实 /bin/sh 往返——shell 解析 Quote 产物必须还原出原词（含元字符）。
+                if (OperatingSystem.IsMacOS()) {
+                    foreach (string word in new[] { "/opt/my tools/claude", "it's", "say \"hi\"", "$HOME `x` $(x); |&<>", "", "a b  c" }) {
+                        var info = new ProcessStartInfo("/bin/sh") { UseShellExecute = false, RedirectStandardOutput = true };
+                        info.ArgumentList.Add("-c");
+                        info.ArgumentList.Add("printf %s " + Shell.Quote(word));
+                        using (var process = Process.Start(info)) {
+                            string got = process.StandardOutput.ReadToEnd();
+                            process.WaitForExit();
+                            Require(process.ExitCode == 0 && got == word);
+                        }
+                    }
+                }
+            });
+            test("Phase 1: archive append is idempotent, horizon-capped and damage-tolerant", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-arch-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    var index = new LogIndex();
+                    index.Files.Add(new LogFile { Name = "a.jsonl", Hours = {
+                        { LogIndex.BucketKey(now.AddHours(-1), "openai", "m"), new Bucket { I = 100, O = 10, R = 1, D = .5 } },
+                        { LogIndex.BucketKey(now.AddDays(-40), "openai", "m"), new Bucket { I = 7, R = 1 } } } });
+                    index.Expiring[LogIndex.BucketKey(now.AddDays(-41), "relay", "m2")] = new Bucket { I = 3, R = 1 };
+                    index.Expiring[LogIndex.BucketKey(now.AddDays(-400), "old", "m3")] = new Bucket { I = 9, R = 1 };   // 超出归档视野：永不落盘
+                    Require(UsageArchive.Append(index, "codex", now) == 3);
+                    // 按桶的 UTC 月份分文件：当月桶与 8 月的过期桶分属两个文件，共 3 行。
+                    string[] files = Directory.GetFiles(UsageArchive.Folder(), "usage-*.jsonl", SearchOption.AllDirectories);
+                    Require(files.Length == 2);
+                    Func<string[]> allLines = () => files.SelectMany(f => File.ReadAllLines(f)).ToArray();
+                    Require(allLines().Length == 3 && allLines().All(l => l.StartsWith("{") && l.EndsWith("}")));
+                    Require(UsageArchive.Append(index, "codex", now) == 0);                 // 幂等：重复归档不追加
+                    Require(allLines().Length == 3);
+                    // 坏行容忍：崩溃撕掉的尾行（8 月文件缺了 I=3 那行、多了一行垃圾）只损失
+                    // 该行本身，其余行照常解析。
+                    string august = files.First(f => File.ReadAllText(f).Contains("\"i\":7"));
+                    string line7 = File.ReadAllLines(august).First(l => l.Contains("\"i\":7"));
+                    File.WriteAllLines(august, new[] { line7, "{torn" });
+                    UsageArchive.InvalidateCache();
+                    List<ArchiveRow> rows = UsageArchive.RowsFor("codex", now.AddDays(1));
+                    Require(rows.Count == 2 && Math.Abs(rows.Sum(r => r.I) - 107) < 1e-9);
+                    index.Files[0].Hours[LogIndex.BucketKey(now.AddHours(-2), "openai", "m")] = new Bucket { I = 5, R = 1 };
+                    // 坏行之后照常追加；被撕掉的那行也会在下轮自愈式补回（键已不在盘上）。
+                    Require(UsageArchive.Append(index, "codex", now) == 2);
+                    rows = UsageArchive.RowsFor("codex", now.AddDays(1));
+                    Require(rows.Count == 4 && Math.Abs(rows.Sum(r => r.I) - 115) < 1e-9);
+                    // 行往返：序列化出的行能原样解析回同一桶。
+                    string line100 = allLines().First(l => l.Contains("\"i\":100"));
+                    ArchiveRow back; Require(ArchiveRow.TryParse(line100, out back) && back.Agent == "codex" && back.I == 100 && back.O == 10 && back.R == 1 && Math.Abs(back.D - .5) < 1e-9 && back.Hour <= now.AddHours(-1));
+                    Require(!ArchiveRow.TryParse("not json", out back) && !ArchiveRow.TryParse("{\"a\":\"codex\",\"k\":\"bad\"}", out back));
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1: the merged view answers for deleted-source hours and never touches the hot index", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-merge-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    var source = new LogIndex();
+                    source.Files.Add(new LogFile { Name = "x.jsonl", Hours = { { LogIndex.BucketKey(now.AddDays(-40), "openai", "m"), new Bucket { I = 40, R = 2, D = .2 } } } });
+                    Require(UsageArchive.Append(source, "codex", now) == 1);
+                    var hot = new LogIndex();
+                    hot.Files.Add(new LogFile { Name = "y.jsonl", Hours = { { LogIndex.BucketKey(now.AddHours(-2), "openai", "m"), new Bucket { I = 5, R = 1 } } } });
+                    LogIndex merged = UsageArchive.MergeInto(hot, "codex", now);
+                    // 桶键只到整点：比较用同一 FloorHour。
+                    Func<DateTime, DateTime> floor = at => DateTime.ParseExact(at.ToUniversalTime().ToString("yyyyMMddHH", CultureInfo.InvariantCulture), "yyyyMMddHH", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+                    Require(merged != hot && hot.Entries().Count == 1 && hot.Entries().Sum(e => e.Tokens) == 5);   // 热索引原样
+                    Require(merged.Entries().Count == 2 && Math.Abs(merged.Entries().Sum(e => e.Tokens) - 45) < 1e-9);
+                    Require(merged.Entries().Any(e => e.Hour == floor(now.AddDays(-40))) && merged.Entries().Any(e => e.Hour == floor(now.AddHours(-2))));
+                    Require(UsageArchive.MergeInto(hot, "codex", now).Entries().Count == 2);       // 合并幂等，不双计
+                    Require(UsageArchive.MergeInto(hot, "claude", now) == hot);                    // 其他 agent 无归档行：原样返回
+                    // 边界不双计：同一桶键归档与热索引都有时热值赢。（Entries 有缓存：
+                    // 构造新的热索引而不是往已渲染过的索引里补桶。）
+                    var hot2 = new LogIndex();
+                    hot2.Files.Add(new LogFile { Name = "y.jsonl", Hours = {
+                        { LogIndex.BucketKey(now.AddHours(-2), "openai", "m"), new Bucket { I = 5, R = 1 } },
+                        { LogIndex.BucketKey(now.AddDays(-40), "openai", "m"), new Bucket { I = 999 } } } });
+                    LogIndex guarded = UsageArchive.MergeInto(hot2, "codex", now);
+                    Require(Math.Abs(guarded.Entries().Where(e => e.Hour == floor(now.AddDays(-40))).Sum(e => e.Tokens) - 999) < 1e-9 && guarded.Entries().Count == 2);
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1: Finish parks the hours leaving the retention window into the archive lane", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-finish-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    var index = new LogIndex();
+                    index.Files.Add(new LogFile { Name = "s.jsonl", Hours = {
+                        { LogIndex.BucketKey(now.AddHours(-1), "openai", "m"), new Bucket { I = 10, R = 1 } },
+                        { LogIndex.BucketKey(now.AddDays(-34), "openai", "m"), new Bucket { I = 20, R = 1 } } } });
+                    LogReader.Finish(index, now, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "s.jsonl" });
+                    Require(index.Files[0].Hours.Count == 1 && index.Expiring.Count == 1);   // 热窗口 33 天：34 天前的桶进 lane
+                    // 本轮待归档 = 热桶（新键）+ lane 桶，共 2 行新键；lane 由 ScanAll 排空
+                    // （Append 自身不动它），这里照 ScanAll 的顺序清掉。
+                    Require(UsageArchive.Append(index, "codex", now) == 2);
+                    index.Expiring.Clear();
+                    Require(index.Expiring.Count == 0);
+                    List<ArchiveRow> rows = UsageArchive.RowsFor("codex", LogReader.HotFrom(now));
+                    Require(rows.Count == 1 && Math.Abs(rows[0].I - 20) < 1e-9);
+                    // 源日志早已删除：合并层让 34 天前的数据重新可查。
+                    LogIndex merged = UsageArchive.MergeInto(index, "codex", now);
+                    Require(Math.Abs(merged.Entries().Sum(e => e.Tokens) - 30) < 1e-9);
+                    // 归档关闭时（自测默认）：裁剪行为与 Phase 1 之前一致，lane 保持空。
+                    UsageArchive.Enabled = false;
+                    var plain = new LogIndex();
+                    plain.Files.Add(new LogFile { Name = "t.jsonl", Hours = { { LogIndex.BucketKey(now.AddDays(-34), "openai", "m"), new Bucket { I = 1 } } } });
+                    LogReader.Finish(plain, now, null);
+                    Require(plain.Files[0].Hours.Count == 0 && plain.Expiring.Count == 0);
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1: daily history and merge trim at the 370-day horizon, not 30", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-horizon-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);   // 空归档：只测 FromIndexes/Merge 的窗口边界
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime today = new DateTime(2026, 10, 8, 0, 0, 0, DateTimeKind.Utc);
+                    var index = new LogIndex();
+                    index.Files.Add(new LogFile { Name = "a.jsonl", Hours = {
+                        { LogIndex.BucketKey(today.AddDays(-369).AddHours(12), "openai", "m"), new Bucket { I = 369, R = 1 } },
+                        { LogIndex.BucketKey(today.AddDays(-370).AddHours(12), "openai", "m"), new Bucket { I = 370, R = 1 } },
+                        { LogIndex.BucketKey(today.AddHours(12), "openai", "m"), new Bucket { I = 1, R = 1 } } } });
+                    var h = HistoryService.FromIndexes(UsageArchive.MergeAll(new Dictionary<string, LogIndex> { { "codex", index } }, today), TimeZoneInfo.Utc, today, UsageArchive.HorizonDays);
+                    var days = h.Days.Select(d => d.Day).ToList();
+                    Require(days.Count == 2 && days.Contains(HistoryService.DayKey(today.AddDays(-369))) && days.Contains(HistoryService.DayKey(today)));
+                    Require(!days.Contains(HistoryService.DayKey(today.AddDays(-370))));    // 370 天边界之外被裁
+                    // Merge 的"历史最大值"语义保留，裁剪窗口同步放宽到 370 天。
+                    // 注意 Merge 只携带 previous 的旧行，从不裁剪 next（next 的窗口由
+                    // FromIndexes 决定）；边界探测用 next 没有的日期。
+                    var stored = new UsageHistory { Zone = h.Zone, Engine = h.Engine, Days = {
+                        new DayUsage { Day = HistoryService.DayKey(today.AddDays(-369)), Agent = "codex", Tokens = 5 },
+                        new DayUsage { Day = HistoryService.DayKey(today.AddDays(-380)), Agent = "codex", Tokens = 50 },
+                        new DayUsage { Day = HistoryService.DayKey(today.AddDays(-100)), Agent = "codex", Tokens = 7 } } };
+                    var merged = HistoryService.Merge(stored, h, HistoryService.DayKey(today.AddDays(-(UsageArchive.HorizonDays - 1))), HistoryService.DayKey(today));
+                    Require(merged.Days.First(d => d.Day == HistoryService.DayKey(today.AddDays(-369))).Tokens == 369);
+                    Require(merged.Days.First(d => d.Day == HistoryService.DayKey(today.AddDays(-100))).Tokens == 7);   // 370 天内的旧行携带
+                    Require(!merged.Days.Any(d => d.Day == HistoryService.DayKey(today.AddDays(-380))));                // 窗口外不携带
+                    // 旧口径仍受支持：Merge 用 30 天 oldestDay 时，30 天前的既有行不携带（原行为不变）。
+                    // Merge 会原地改写并返回 next：第二次调用用新派生的 next，别复用被改写的 h。
+                    var h30 = HistoryService.FromIndexes(UsageArchive.MergeAll(new Dictionary<string, LogIndex> { { "codex", index } }, today), TimeZoneInfo.Utc, today, UsageArchive.HorizonDays);
+                    var merged30 = HistoryService.Merge(stored, h30, HistoryService.DayKey(today.AddDays(-29)), HistoryService.DayKey(today));
+                    Require(!merged30.Days.Any(d => d.Day == HistoryService.DayKey(today.AddDays(-100))));
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1 P0: Append never mutates the index (cloned pending; duplicate keys summed into the row)", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-p0-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    var index = new LogIndex();
+                    var first = new Bucket { I = 100, O = 10, R = 1, D = .5 };
+                    var second = new Bucket { I = 40, C = 5, R = 2, D = .2 };
+                    // 同键两个会话文件（恢复出的同族会话的常态）。
+                    index.Files.Add(new LogFile { Name = "a.jsonl", Hours = { { LogIndex.BucketKey(now.AddHours(-1), "openai", "m"), first } } });
+                    index.Files.Add(new LogFile { Name = "b.jsonl", Hours = { { LogIndex.BucketKey(now.AddHours(-1), "openai", "m"), second } } });
+                    Require(UsageArchive.Append(index, "codex", now) == 1);
+                    Require(first.I == 100 && first.O == 10 && first.R == 1 && Math.Abs(first.D - .5) < 1e-9);   // 活桶数值原样
+                    Require(second.I == 40 && second.C == 5 && second.R == 2 && Math.Abs(second.D - .2) < 1e-9);
+                    List<ArchiveRow> rows = UsageArchive.RowsFor("codex", now.AddDays(1));
+                    Require(rows.Count == 1 && Math.Abs(rows[0].I - 140) < 1e-9 && Math.Abs(rows[0].C - 5) < 1e-9 && Math.Abs(rows[0].O - 10) < 1e-9 && Math.Abs(rows[0].R - 3) < 1e-9 && Math.Abs(rows[0].D - .7) < 1e-9);
+                    Require(UsageArchive.Append(index, "codex", now) == 0);              // 幂等：不追加
+                    Require(first.I == 100 && second.I == 40);                           // 且仍不改活桶
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1 P1: imported-device files do not mask archive rows in the merged view", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-p1-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    var source = new LogIndex();
+                    source.Files.Add(new LogFile { Name = "x.jsonl", Hours = { { LogIndex.BucketKey(now.AddDays(-40), "openai", "m"), new Bucket { I = 40, R = 1 } } } });
+                    Require(UsageArchive.Append(source, "codex", now) == 1);
+                    Func<DateTime, DateTime> floor = at => DateTime.ParseExact(at.ToUniversalTime().ToString("yyyyMMddHH", CultureInfo.InvariantCulture), "yyyyMMddHH", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+                    // 导入设备文件与归档同键：归档行仍并入（不同来源各自成立，40+70=110）。
+                    var hot = new LogIndex();
+                    hot.Files.Add(new LogFile { Name = "device:ffff01", Hours = { { LogIndex.BucketKey(now.AddDays(-40), "openai", "m"), new Bucket { I = 70 } } } });
+                    LogIndex merged = UsageArchive.MergeInto(hot, "codex", now);
+                    Require(merged != hot);
+                    Require(Math.Abs(merged.Entries().Where(e => e.Hour == floor(now.AddDays(-40))).Sum(e => e.Tokens) - 110) < 1e-9);
+                    // 对照：同键在本机（非导入）文件里时，归档行仍被跳过（本机热值赢，不双计）。
+                    var hot2 = new LogIndex();
+                    hot2.Files.Add(new LogFile { Name = "local.jsonl", Hours = { { LogIndex.BucketKey(now.AddDays(-40), "openai", "m"), new Bucket { I = 70 } } } });
+                    Require(UsageArchive.MergeInto(hot2, "codex", now) == hot2);
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1 P2a: a failed archive write keeps the expiring lane and the untrimmed index on disk", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-p2-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    var index = new LogIndex();
+                    index.Files.Add(new LogFile { Name = "s.jsonl", Hours = {
+                        { LogIndex.BucketKey(now.AddHours(-1), "openai", "m"), new Bucket { I = 10, R = 1 } },
+                        { LogIndex.BucketKey(now.AddDays(-34), "openai", "m"), new Bucket { I = 20, R = 1 } } } });
+                    LogReader.Finish(index, now, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "s.jsonl" });
+                    Require(index.Expiring.Count == 1);
+                    // 注入失败：archive 路径被普通文件占位，建目录必抛 → Append 返回 -1。
+                    Directory.CreateDirectory(dir);
+                    File.WriteAllText(Path.Combine(dir, "archive"), "not a directory");
+                    UsageScanner.Persist("codex-logs.json", index, "codex", now);
+                    Require(index.Expiring.Count == 1);                                             // 失败：lane 保留待重试
+                    Require(!File.Exists(Path.Combine(dir, "codex-logs.json")));                    // 失败：不落盘已裁剪索引
+                    File.Delete(Path.Combine(dir, "archive"));                                      // 恢复后下一轮重试成功
+                    UsageScanner.Persist("codex-logs.json", index, "codex", now);
+                    Require(index.Expiring.Count == 0 && File.Exists(Path.Combine(dir, "codex-logs.json")));
+                    List<ArchiveRow> rows = UsageArchive.RowsFor("codex", LogReader.HotFrom(now));
+                    Require(rows.Count == 1 && Math.Abs(rows[0].I - 20) < 1e-9);                    // 出窗桶经重试入库
+                } finally { UsageArchive.Enabled = enabled; Store.SwapData(previous); UsageArchive.InvalidateCache(); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 1: archive files ride in automatic backups and restore", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cum-archbk-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    Directory.CreateDirectory(Path.Combine(dir, "archive"));
+                    File.WriteAllText(Path.Combine(dir, "archive", "usage-2026-08.jsonl"), "{\"a\":\"codex\",\"k\":\"2026081509|openai|m\",\"i\":1}");
+                    File.WriteAllText(Path.Combine(dir, "archive", "notes.txt"), "not a usage file");
+                    Require(Backups.Included("archive/usage-2026-08.jsonl") && !Backups.Included("archive/notes.txt") && !Backups.Included("archive/sub/usage-2026-08.jsonl"));
+                    var config = new AppConfig { BackupKeep = 2 }; DateTime now = DateTime.UtcNow;
+                    string zip = Backups.Create(config, true, now);
+                    using (var archive = System.IO.Compression.ZipFile.OpenRead(zip))
+                        Require(archive.Entries.Any(e => e.FullName == "archive/usage-2026-08.jsonl") && archive.Entries.All(e => e.FullName != "archive/notes.txt"));
+                    File.Delete(Path.Combine(dir, "archive", "usage-2026-08.jsonl"));
+                    Backups.Restore(config, zip, now.AddSeconds(5));
+                    Require(File.ReadAllText(Path.Combine(dir, "archive", "usage-2026-08.jsonl")).Contains("2026081509"));
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            // ── Phase 2：额度刷新体系（LimitsRuntime：退避 / 凭据失效 / 定向刷新 / burn rate）──
+            Func<double, ProviderState> percentState = remaining => new ProviderState { Id = "t", Status = "ready", Quotas = { new Quota { Label = "5 小时", Used = 100 - remaining } } };
+            test("Phase 2: consecutive transient failures back off 1/2/4/8 min, capped at the platform period", () => {
+                var config = new AppConfig { RefreshMinutes = 60, InUseMinutes = 2 };   // 60 分钟周期只为观察完整曲线
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                var backoffs = new List<int>();
+                for (int i = 0; i < 6; i++) {
+                    limits.RecordFailure("codex", "error", config, false, t);
+                    backoffs.Add(limits.ChannelOf("codex").LastBackoffMinutes);
+                    t += TimeSpan.FromMinutes(limits.ChannelOf("codex").LastBackoffMinutes);   // 到点重试再次失败
+                }
+                Require(String.Join(",", backoffs) == "1,2,4,8,8,8");
+                Require(limits.ChannelOf("codex").Kind == "backoff" && limits.ChannelOf("codex").TransientFailures == 6);
+                // 退避期内不到期；退避一满（20 秒提前量）即到期
+                Require(!limits.AutoDue(config, "codex", false, t - TimeSpan.FromSeconds(21)));
+                Require(limits.AutoDue(config, "codex", false, t - TimeSpan.FromSeconds(20)));
+                // 封顶取平台配置周期：kimi 单独配 2 分钟 → 曲线 1,2,2,2
+                var capped = new LimitsRuntime(); var config2 = new AppConfig { RefreshMinutes = 60 }; config2.ProviderMinutes["kimi"] = 2;
+                DateTime k = t;
+                var cappedCurve = new List<int>();
+                for (int i = 0; i < 4; i++) {
+                    capped.RecordFailure("kimi", "error", config2, false, k);
+                    cappedCurve.Add(capped.ChannelOf("kimi").LastBackoffMinutes);
+                    k += TimeSpan.FromMinutes(capped.ChannelOf("kimi").LastBackoffMinutes);
+                }
+                Require(String.Join(",", cappedCurve) == "1,2,2,2");
+            });
+            test("Phase 2: a success resets the backoff, counters and cadence", () => {
+                var config = new AppConfig();   // RefreshMinutes 5
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                limits.RecordFailure("claude", "error", config, false, t);
+                limits.RecordFailure("claude", "error", config, false, t.AddMinutes(1));
+                Require(limits.ChannelOf("claude").Kind == "backoff" && limits.ChannelOf("claude").ConsecutiveFailures == 2);
+                DateTime good = t.AddMinutes(3);
+                limits.RecordSuccess("claude", percentState(60), good);
+                var ch = limits.ChannelOf("claude");
+                Require(ch.Kind == "normal" && ch.ConsecutiveFailures == 0 && ch.TransientFailures == 0 && ch.NextAutoUtc == DateTime.MinValue);
+                Require(ch.LastGoodUtc == good && ch.LastAttemptUtc == good);   // lastGood/lastAttempt 分离记录
+                // 复位后按正常周期到期（5 分钟，含 20 秒提前量）
+                Require(!limits.AutoDue(config, "claude", false, good.AddMinutes(5).AddSeconds(-21)));
+                Require(limits.AutoDue(config, "claude", false, good.AddMinutes(5).AddSeconds(-20)));
+            });
+            test("Phase 2: credential failures (expired/setup) only slow-probe every 30 min; ResetFor revives", () => {
+                var config = new AppConfig();
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                limits.RecordSuccess("zcode", percentState(80), t);
+                limits.RecordFailure("zcode", "expired", config, false, t.AddMinutes(1));
+                Require(limits.ChannelOf("zcode").Kind == "auth" && limits.ChannelOf("zcode").ConsecutiveFailures == 1);
+                Require(limits.ChannelOf("zcode").LastBackoffMinutes == 0);            // 不进退避
+                DateTime failed = t.AddMinutes(1);
+                Require(!limits.AutoDue(config, "zcode", false, failed.AddMinutes(29).AddSeconds(59)));   // 30 分钟内不探测
+                Require(limits.AutoDue(config, "zcode", false, failed.AddMinutes(30)));                    // 30 分钟一到允许一次探测
+                limits.RecordFailure("deepseek", "setup", config, false, t);
+                Require(!limits.AutoDue(config, "deepseek", false, t.AddMinutes(29).AddSeconds(59)));
+                // 凭据变更（定向刷新）ResetFor 后立即到期；平台移除 Drop 后通道重建同样立即到期
+                limits.ResetFor("zcode");
+                Require(limits.AutoDue(config, "zcode", false, failed));
+                limits.RecordFailure("zcode", "expired", config, false, failed);
+                limits.Drop("zcode");
+                Require(limits.AutoDue(config, "zcode", false, failed));
+            });
+            test("Phase 2: auth probe re-arms after a failed probe and revives after a success (CLI silent import)", () => {
+                var config = new AppConfig();
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                limits.RecordFailure("kimi", "expired", config, false, t);   // 密钥失效
+                // 第 30 分钟：慢速探测仍失败（CLI 还没登录）→ 重新进入 auth 并重新计时
+                DateTime probe1 = t.AddMinutes(30);
+                Require(limits.AutoDue(config, "kimi", false, probe1));
+                limits.RecordFailure("kimi", "expired", config, false, probe1);
+                Require(limits.ChannelOf("kimi").Kind == "auth" && limits.ChannelOf("kimi").LastBackoffMinutes == 0);
+                Require(!limits.AutoDue(config, "kimi", false, probe1.AddMinutes(29).AddSeconds(59)));
+                // 第 60 分钟：用户已在 CLI 登录，Fetch 内部静默导入成功 → 复位复活
+                DateTime probe2 = probe1.AddMinutes(30);
+                Require(limits.AutoDue(config, "kimi", false, probe2));
+                limits.RecordSuccess("kimi", percentState(90), probe2);
+                Require(limits.ChannelOf("kimi").Kind == "normal" && limits.ChannelOf("kimi").ConsecutiveFailures == 0);
+                Require(limits.ChannelOf("kimi").LastGoodUtc == probe2 && limits.ChannelOf("kimi").LastAttemptUtc == probe2);
+                Require(!limits.AutoDue(config, "kimi", false, probe2.AddMinutes(5).AddSeconds(-21)));
+                Require(limits.AutoDue(config, "kimi", false, probe2.AddMinutes(5).AddSeconds(-20)));
+            });
+            test("Phase 2: credential changes retarget only the changed platforms", () => {
+                var keys = new Dictionary<string, string> { { "deepseek", "k1" }, { "kimi", "k2" }, { "zcode", "" } };
+                var changed = new Dictionary<string, string> { { "deepseek", "k9" }, { "kimi", "k2" }, { "zcode", "k3" } };
+                var enabled = new[] { "deepseek", "kimi", "zcode", "codex" };
+                var plan = LimitsRuntime.PlanCredentialRefresh(keys, changed, new string[0], enabled, enabled);
+                Require(plan.Reset.Contains("deepseek") && plan.Reset.Contains("zcode"));   // 改 A 不触发 B
+                Require(!plan.Reset.Contains("kimi") && !plan.Reset.Contains("codex") && plan.Forget.Count == 0);
+                // 端点区域变化、启用集合新增/移除
+                var plan2 = LimitsRuntime.PlanCredentialRefresh(keys, keys, new[] { "kimi" }, new[] { "deepseek", "copilot" }, new[] { "deepseek", "grok", "kimi" });
+                Require(plan2.Reset.SetEquals(new HashSet<string> { "kimi", "grok" }) && plan2.Forget.SetEquals(new HashSet<string> { "copilot" }));
+                // 密钥未变但平台被停用：只进 Forget，不进 Reset
+                var plan3 = LimitsRuntime.PlanCredentialRefresh(keys, keys, new string[0], enabled, new[] { "kimi", "zcode", "codex" });
+                Require(plan3.Forget.Contains("deepseek") && !plan3.Reset.Contains("deepseek"));
+            });
+            test("Phase 2: burn rate shortens fast burners, lengthens idle ones, degrades without samples", () => {
+                var config = new AppConfig();   // adaptive（默认）、RefreshMinutes 5、InUseMinutes 2
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                // 单样本不参与决策：固定周期
+                limits.RecordSuccess("codex", percentState(90), t);
+                Require(limits.ChannelOf("codex").BurnPerHour == null && limits.EffectiveMinutes(config, "codex", false) == 5);
+                // 10%/h：5 × 5/10 = 2.5 → 压到下限附近
+                limits.RecordSuccess("codex", percentState(80), t.AddHours(1));
+                Require(Math.Abs(limits.ChannelOf("codex").BurnPerHour.Value - 10) < 1e-9);
+                int fast = limits.EffectiveMinutes(config, "codex", false);
+                Require(fast >= config.InUseMinutes && fast <= 3);
+                Require(limits.EffectiveMinutes(config, "codex", true) == config.InUseMinutes);   // 使用中不高于下限
+                // 0.5%/h 与零消耗：拉长到上限 30
+                var slow = new LimitsRuntime();
+                slow.RecordSuccess("kimi", percentState(99), t);
+                slow.RecordSuccess("kimi", percentState(98.5), t.AddHours(1));
+                Require(slow.EffectiveMinutes(config, "kimi", false) == LimitsRuntime.AdaptiveMaxMinutes);
+                var idle = new LimitsRuntime();
+                idle.RecordSuccess("kimi", percentState(50), t);
+                idle.RecordSuccess("kimi", percentState(50), t.AddHours(1));
+                Require(idle.EffectiveMinutes(config, "kimi", false) == LimitsRuntime.AdaptiveMaxMinutes);
+                // 基准速率（5%/h）保持配置周期；固定模式不参与
+                var reference = new LimitsRuntime();
+                reference.RecordSuccess("kimi", percentState(95), t);
+                reference.RecordSuccess("kimi", percentState(90), t.AddHours(1));
+                Require(reference.EffectiveMinutes(config, "kimi", false) == 5);
+                Require(reference.EffectiveMinutes(new AppConfig { RefreshMode = "fixed" }, "kimi", false) == 5);
+            });
+            test("Phase 2: burn rate median rejects a single noisy sample pair", () => {
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                limits.RecordSuccess("kimi", percentState(100), t);
+                limits.RecordSuccess("kimi", percentState(95), t.AddHours(1));   // 5%/h
+                limits.RecordSuccess("kimi", percentState(40), t.AddHours(2));   // 坏点 55%/h
+                limits.RecordSuccess("kimi", percentState(35), t.AddHours(3));   // 5%/h
+                Require(Math.Abs(limits.ChannelOf("kimi").BurnPerHour.Value - 5) < 1e-9);
+            });
+            test("Phase 2: a rising remaining (quota reset) clears the burn rate state", () => {
+                var config = new AppConfig();
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                limits.RecordSuccess("kimi", percentState(80), t);
+                limits.RecordSuccess("kimi", percentState(60), t.AddHours(1));   // 20%/h
+                Require(limits.ChannelOf("kimi").BurnPerHour.HasValue);
+                limits.RecordSuccess("kimi", percentState(70), t.AddHours(2));   // 回升＝窗口重置
+                Require(limits.ChannelOf("kimi").BurnPerHour == null);
+                Require(limits.EffectiveMinutes(config, "kimi", false) == 5);    // 退化回固定周期
+            });
+            test("Phase 2: balance-only models keep the fixed period", () => {
+                var config = new AppConfig();
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                Func<ProviderState> balance = () => new ProviderState { Id = "deepseek", Status = "ready", Balances = { new Balance { Currency = "USD", Amount = 8 } } };
+                limits.RecordSuccess("deepseek", balance(), t);
+                limits.RecordSuccess("deepseek", balance(), t.AddHours(1));
+                Require(!limits.ChannelOf("deepseek").HasPercentModel && limits.ChannelOf("deepseek").BurnPerHour == null);
+                Require(limits.EffectiveMinutes(config, "deepseek", false) == 5);
+            });
+            // ── Phase 3：数据源健康状态与诊断报告 ──
+            // 五态判定涉及凭据存在性（data/<id>.key 与环境变量）：把数据目录指到空临时目录、
+            // 暂时摘掉 Key 型平台的环境变量，测试不读真实凭据，结束后原样恢复。
+            Action<Action> withCleanCredentials = body => {
+                string previous = Store.SwapData(Path.Combine(Path.GetTempPath(), "cu-phase3-" + Guid.NewGuid().ToString("N")));
+                string[] names = { "DEEPSEEK_API_KEY", "KIMI_CODE_API_KEY", "OPENCODE_API_KEY", "Z_AI_API_KEY", "BIGMODEL_API_KEY", "ZHIPU_API_KEY", "ZHIPUAI_API_KEY", "GLM_API_KEY" };
+                var saved = new Dictionary<string, string>();
+                foreach (string name in names) { saved[name] = Environment.GetEnvironmentVariable(name); Environment.SetEnvironmentVariable(name, null); }
+                try { body(); }
+                finally {
+                    Store.SwapData(previous);
+                    foreach (var pair in saved) Environment.SetEnvironmentVariable(pair.Key, pair.Value);
+                    SourceHealth.ClearErrors();
+                }
+            };
+            test("Phase 3: five health states aggregate channels, readings and credentials", () => withCleanCredentials(() => {
+                var config = new AppConfig { Enabled = new[] { "codex", "claude", "deepseek", "kimi", "pi" } };
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                Func<double, ProviderState> good = remaining => new ProviderState { Id = "kimi", Status = "ready", LastSuccess = t.ToString("o"), Quotas = { new Quota { Label = "5 小时", Used = 100 - remaining } } };
+                limits.RecordSuccess("kimi", good(80), t);
+                Require(SourceHealth.StateOf("kimi", config, good(80), limits.ChannelOf("kimi")) == SourceHealth.Ok);
+                // 瞬时失败：一次 error → transient（stale 保留旧读数由 RetainLastGood 负责，状态机照常退避）
+                limits.RecordFailure("kimi", "error", config, false, t.AddMinutes(1));
+                Require(SourceHealth.StateOf("kimi", config, new ProviderState { Id = "kimi", Status = "error", Stale = true }, limits.ChannelOf("kimi")) == SourceHealth.Transient);
+                // 连续瞬时失败 ≥ 2 → 退避中
+                limits.RecordFailure("kimi", "error", config, false, t.AddMinutes(3));
+                Require(SourceHealth.StateOf("kimi", config, new ProviderState { Id = "kimi", Status = "error", Stale = true }, limits.ChannelOf("kimi")) == SourceHealth.Backoff);
+                // 凭据失效（expired → auth 态）
+                limits.RecordFailure("codex", "expired", config, false, t.AddMinutes(1));
+                Require(SourceHealth.StateOf("codex", config, new ProviderState { Id = "codex", Status = "expired" }, limits.ChannelOf("codex")) == SourceHealth.Auth);
+                // 未配置：未启用 / 启用但没有任何凭据
+                Require(SourceHealth.StateOf("grok", config, new ProviderState { Id = "grok" }, null) == SourceHealth.Unconfigured);
+                Require(SourceHealth.StateOf("deepseek", config, new ProviderState { Id = "deepseek" }, null) == SourceHealth.Unconfigured);
+                // 无通道（CLI 只读缓存的口径）：按缓存读数推导
+                Require(SourceHealth.StateOf("claude", config, new ProviderState { Id = "claude", Status = "ready" }, null) == SourceHealth.Ok);
+                Require(SourceHealth.StateOf("claude", config, new ProviderState { Id = "claude", Status = "setup" }, null) == SourceHealth.Unconfigured);
+                // pi 无需凭据：error 读数在无通道时按瞬时失败处理（确定性，不依赖本机凭据）
+                Require(SourceHealth.StateOf("pi", config, new ProviderState { Id = "pi", Status = "error" }, null) == SourceHealth.Transient);
+                // pi 只统计本机日志，视为已配置
+                Require(SourceHealth.StateOf("pi", config, new ProviderState { Id = "pi" }, null) == SourceHealth.Ok);
+            }));
+            test("Phase 3: health rows carry times, failures and the last error; scan errors are recorded", () => withCleanCredentials(() => {
+                var config = new AppConfig { Enabled = new[] { "kimi", "pi" } };
+                var limits = new LimitsRuntime();
+                DateTime t = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+                Func<ProviderState> good = () => new ProviderState { Id = "kimi", Status = "ready", LastSuccess = t.ToString("o"), Quotas = { new Quota { Label = "5 小时", Used = 20 } } };
+                limits.RecordSuccess("kimi", good(), t);
+                limits.RecordFailure("kimi", "error", config, false, t.AddMinutes(1));
+                limits.RecordFailure("kimi", "error", config, false, t.AddMinutes(3));
+                SourceHealth.RecordError("kimi", new InvalidOperationException("boom"));
+                var rows = SourceHealth.Rows(config, new[] { good() }, id => limits.ChannelOf(id));
+                var kimi = rows.Single(r => r.Id == "kimi");
+                Require(kimi.State == SourceHealth.Backoff && kimi.ConsecutiveFailures == 2 && kimi.Name.Length > 0);
+                Require(kimi.LastAttemptUtc.StartsWith("2026-10-01T00:03") && kimi.LastSuccessUtc.StartsWith("2026-10-01T00:00"));
+                Require(kimi.LastError.Contains("boom") && kimi.LastError.Contains("InvalidOperationException"));
+                // 目录里没有读数的平台也有一行（未启用 → 未配置）
+                Require(rows.Any(r => r.Id == "codex") && rows.Single(r => r.Id == "codex").State == SourceHealth.Unconfigured);
+                Require(rows.Single(r => r.Id == "pi").State == SourceHealth.Ok);
+                // 记录可清除，避免跨用例串味
+                SourceHealth.ClearErrors();
+                Require(SourceHealth.LastErrorOf("kimi") == null);
+            }));
+            test("Phase 3: scrub catches key shapes; paths mask to ~ and URLs keep the host only", () => {
+                // 长随机 token 混入非 hex 字符（纯 hex 40+ 位是单向摘要，P2-4 起予以保留）
+                string longToken = new string('a', 43) + "Z";
+                string scrubbed = Diagnostics.Scrub("api_key=abcdef12345678 token=987654321abcdef Authorization: Bearer abc.def.ghi ghp_" + new string('g', 28) + " " + longToken);
+                Require(!scrubbed.Contains("abcdef12345678") && !scrubbed.Contains("987654321abcdef") && !scrubbed.Contains("ghp_") && !scrubbed.Contains(longToken));
+                Require(Diagnostics.HostOf("https://user:pw@relay.example.com/v1/x") == "relay.example.com");
+                Require(Diagnostics.HostOf("relay.example.com/v1") == "relay.example.com");
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                Require(Diagnostics.MaskPath(Path.Combine(home, "data")) == "~/data" && Diagnostics.MaskPath(home) == "~");
+                Require(!Diagnostics.MaskPath(home + "-other").StartsWith("~"));
+            });
+            test("Phase 3: the diagnostic report is redacted and shared by the settings page and CLI doctor", () => withCleanCredentials(() => {
+                // 数据目录特意放在用户主目录下：验证路径打码（~ 替换）这条红线。
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string underHome = Path.Combine(home, ".cu-phase3-report-" + Guid.NewGuid().ToString("N"));
+                string outer = Store.SwapData(underHome);
+                try {
+                    Directory.CreateDirectory(underHome);
+                    File.WriteAllText(Path.Combine(underHome, "errors.log"), "2026-10-08T00:00:00Z scan kimi IOException 请求失败：sk-fake1234567890abcd\nstack " + new string('x', 50) + "\n");
+                    var config = new AppConfig {
+                        Enabled = new[] { "deepseek" },
+                        WebDavUrl = "https://alice:topsecret@dav.example.com/home", WebDavUser = "alice",
+                        Proxy = "http://127.0.0.1:7890", RefreshMode = "adaptive", RefreshMinutes = 5, SyncMinutes = 60, BackupHours = 24
+                    };
+                    var state = new ProviderState { Id = "deepseek", Status = "error", Message = "请求失败：Bearer sk-fake1234567890abcdef", LastAttempt = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc).ToString("o") };
+                    string report = Diagnostics.BuildReport(config, new[] { state }, null, DateTime.UtcNow);
+                    Require(report.Contains("codeusagemonit 诊断报告") && report.Contains("平台健康") && report.Contains("配置指纹"));
+                    // 无凭据 + 失败读数 → 未配置；错误原文进入「最近错误」列。
+                    Require(report.Contains("未配置") && report.Contains("请求失败"));
+                    // 脱敏红线：假 key、URL 里的用户名/密码、主目录路径一律不出现；host 保留。
+                    Require(!report.Contains("sk-fake") && !report.Contains("topsecret") && !report.Contains("alice"));
+                    Require(!report.Contains(home) && report.Contains("~/"));
+                    Require(report.Contains("dav.example.com") && report.Contains("127.0.0.1"));
+                    // CLI doctor 与桌面共用同一构建器（无通道时按缓存推导），同样脱敏。
+                    string doctor = CliProgram.DoctorReport(config);
+                    Require(doctor.Contains("平台健康") && !doctor.Contains(home) && !doctor.Contains("sk-fake"));
+                } finally { Store.SwapData(outer); try { Directory.Delete(underHome, true); } catch { } }
+            }));
+            // ── Phase 3 初审修正单（P2-1～P2-4）──
+            test("Phase 3 P2-1: LimitsRuntime channel access survives concurrent callers", () => {
+                var config = new AppConfig { RefreshMode = "adaptive" };
+                var limits = new LimitsRuntime();
+                var failures = new List<string>();
+                Action<int> work = seed => {
+                    try {
+                        for (int j = 0; j < 3000; j++) {
+                            string id = "p" + (j % 5);
+                            limits.ChannelOf(id);
+                            limits.AutoDue(config, id, false, DateTime.UtcNow);
+                            if (j % 2 == 0) limits.RecordSuccess(id, new ProviderState { Id = id, Status = "ready", Quotas = { new Quota { Label = "5 小时", Used = 10 } } }, DateTime.UtcNow);
+                            else limits.RecordFailure(id, "error", config, false, DateTime.UtcNow);
+                            limits.EffectiveMinutes(config, id, false);
+                            if (j % 500 == 0) { limits.ResetFor(id); limits.Drop("never-existed"); }
+                        }
+                    } catch (Exception e) { lock (failures) failures.Add(e.GetType().Name + " " + e.Message); }
+                };
+                var threads = new List<System.Threading.Thread>();
+                for (int i = 0; i < 8; i++) { var t = new System.Threading.Thread(() => work(i)); t.Start(); threads.Add(t); }
+                foreach (var t in threads) t.Join();
+                Require(failures.Count == 0);
+            });
+            test("Phase 3 P2-2: errors.log rotation keeps the file bounded and the tail readable", () => {
+                string temp = Path.Combine(Path.GetTempPath(), "cu-p3r-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(temp);
+                try {
+                    Directory.CreateDirectory(Store.Data);
+                    string path = Path.Combine(Store.Data, "errors.log");
+                    var sb = new System.Text.StringBuilder();
+                    for (int i = 0; i < 4000; i++) sb.Append("2026-10-08T00:00:00.0000000Z seed line ").Append(i).Append(' ').Append(new string('a', 150)).Append('\n');
+                    File.WriteAllText(path, sb.ToString(), new System.Text.UTF8Encoding(false));
+                    long before = new FileInfo(path).Length;
+                    Require(before > ErrorLog.MaxBytes);
+                    ErrorLog.Append("rotate", new Exception("marker-after-rotation"));
+                    long after = new FileInfo(path).Length;
+                    Require(after <= ErrorLog.MaxBytes + 8192 && after < before);   // 有界
+                    string text = File.ReadAllText(path);
+                    Require(text.Contains("marker-after-rotation") && text.EndsWith("\n"));
+                    Require(!text.Contains("seed line 0 "));                        // 头部已截掉，尾部保留
+                    // 尾读：取到刚写入的条目，但远小于整文件（不整读大文件）
+                    string tail = ErrorLog.ReadTail(path, 100);
+                    Require(tail.Contains("marker-after-rotation") && tail.Length < before);
+                    // 尾读行数精确（\n 是单字节，多字节字符不会被切开）
+                    File.WriteAllText(path, "第一行\nl2\nl3\nl4\n", new System.Text.UTF8Encoding(false));
+                    Require(ErrorLog.ReadTail(path, 2) == "l3\nl4\n");
+                    Require(ErrorLog.ReadTail(path, 10) == "第一行\nl2\nl3\nl4\n");
+                    Require(ErrorLog.ReadTail(path, 0) == "");
+                    // 未超上限时轮转不触发
+                    File.WriteAllText(path, "small\n", new System.Text.UTF8Encoding(false));
+                    ErrorLog.Append("no-rotate", new Exception("appended"));
+                    Require(File.ReadAllText(path).Contains("small\n"));
+                } finally { Store.SwapData(previous); try { Directory.Delete(temp, true); } catch { } }
+            });
+            test("Phase 3 P2-3: HasCredential sees local CLI sign-in files (kimi/zcode) without reading them", () => {
+                string temp = Path.Combine(Path.GetTempPath(), "cu-p3c-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(temp);
+                // Unix 上 GetFolderPath(UserProfile) 每次 读 $HOME：临时摘换注入路径，结束时恢复。
+                string realHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string fakeHome = Path.Combine(Path.GetTempPath(), "cu-p3c-home-" + Guid.NewGuid().ToString("N"));
+                Environment.SetEnvironmentVariable("HOME", fakeHome);
+                try {
+                    Directory.CreateDirectory(fakeHome);
+                    Require(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) == fakeHome);   // 注入生效
+                    var config = new AppConfig { Enabled = new[] { "kimi", "zcode" } };
+                    Require(!SourceHealth.HasCredential("kimi", config) && !SourceHealth.HasCredential("zcode", config));
+                    // kimi：config.toml 内联 api_key 的存在即算已配置（只看存在，不读内容）
+                    Directory.CreateDirectory(Path.Combine(fakeHome, ".kimi-code"));
+                    File.WriteAllText(Path.Combine(fakeHome, ".kimi-code", "config.toml"), "[providers.\"managed:kimi-code\"]\napi_key = \"placeholder\"\n");
+                    Require(SourceHealth.HasCredential("kimi", config));
+                    // kimi：OAuth 凭据文件同样算
+                    File.Delete(Path.Combine(fakeHome, ".kimi-code", "config.toml"));
+                    Directory.CreateDirectory(Path.Combine(fakeHome, ".kimi-code", "credentials"));
+                    File.WriteAllText(Path.Combine(fakeHome, ".kimi-code", "credentials", "kimi-code.json"), "{}");
+                    Require(SourceHealth.HasCredential("kimi", config));
+                    // zcode：v2/credentials.json
+                    Directory.CreateDirectory(Path.Combine(fakeHome, ".zcode", "v2"));
+                    File.WriteAllText(Path.Combine(fakeHome, ".zcode", "v2", "credentials.json"), "{}");
+                    Require(SourceHealth.HasCredential("zcode", config));
+                    File.Delete(Path.Combine(fakeHome, ".zcode", "v2", "credentials.json"));
+                    Require(!SourceHealth.HasCredential("zcode", config));
+                } finally {
+                    Environment.SetEnvironmentVariable("HOME", realHome);
+                    Store.SwapData(previous);
+                    try { Directory.Delete(fakeHome, true); } catch { }
+                }
+            });
+            test("Phase 3 P2-4: scrub catches GCP keys and 32-hex; ordinary words and commit hashes survive", () => {
+                string gcp = "AIzaSy" + new string('C', 29);                    // AIza 前缀 + 31 位（真实 GCP key 共 35 位）
+                string md5 = "fedcba9876543210fedcba9876543210";                // 32 位十六进制（避开 commit 的子串，断言才有效）
+                string word = "Abcd1234Efgh5678Ijkl9012Mnop3456";               // 32 位普通单词（非纯 hex）
+                string commit = "0123456789abcdef0123456789abcdef01234567";     // 40 位十六进制（commit / SHA-1）
+                string scrubbed = Diagnostics.Scrub("gcp " + gcp + " md5 " + md5 + " word " + word + " commit " + commit);
+                Require(!scrubbed.Contains(gcp) && !scrubbed.Contains(md5));
+                Require(scrubbed.Contains(word) && scrubbed.Contains(commit));
+            });
+            // ── Phase 4：产品力增强（导出 / 热力图 / 服务状态 / CAS / DataSync 三修）──
+            test("Phase 4.1: CSV export escapes RFC 4180 and carries hour and day rows", () => {
+                var bundle = new Devices.ExportBundle { Self = new DeviceIdentity { Id = "self01", Name = "M" }, ExportedUtc = new DateTime(2026, 10, 8, 0, 0, 0, DateTimeKind.Utc) };
+                var remote = new DeviceData { Id = "aaaa11", Name = "R", Exported = "2026-10-07T00:00:00.0000000Z", Version = "1.0" };
+                remote.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) {
+                    { "2026100510|openai|model,with\"comma|hostA/x", new Bucket { I = 100, O = 10, R = 2, D = 1.5 } },
+                    { "2026100511|openai|plain", new Bucket { I = 50, R = 1 } }   // 无 endpoint → 空单元格
+                };
+                bundle.Devices.Add(new DeviceData { Id = "self01" }); bundle.Devices.Add(remote);
+                bundle.Days.Add(new DayUsage { Day = "2026-10-05", Agent = "codex", Tokens = 160, InputTokens = 150, OutputTokens = 10, Requests = 3, Cost = 2.25, TimedRequests = 1, TimedOutput = 8, TimedSeconds = 4 });
+                string csv = Devices.ExportCsv(bundle);
+                Action<string, string> has = (fragment, what) => { if (!csv.Contains(fragment)) throw new Exception(what + " missing; csv:\n" + csv); };
+                Require(csv.Contains("granularity,device_id,agent,period_utc,provider,model,endpoint,input_tokens,") && csv.EndsWith("\r\n"));
+                has("\"model,with\"\"comma\",hostA/x,100,0,0,10,0,2,1.5,0,0,0,0\r\n", "quoted model row");
+                has("hour,aaaa11,codex,2026-10-05T11:00:00Z,openai,plain,,50,0,0,0,0,1,0,0,0,0,0\r\n", "plain hour row");
+                has("day,self01,codex,2026-10-05T00:00:00Z,,,,150,0,0,10,0,3,2.25,0,1,8,4\r\n", "day row");
+                // JSON：可解析、结构对齐、endpoint 缺省为 null（对齐 SQL 的 NULL 口径）。
+                string json = Devices.ExportJson(bundle);
+                object root = J.Parse(json);
+                if (root == null) throw new Exception("json unparseable:\n" + json);
+                var devicesList = ((System.Collections.IEnumerable)J.Get(root, "devices")).Cast<object>().ToList();
+                if (devicesList.Count != 2 || J.Str(J.Get(devicesList[1], "id")) != "aaaa11") throw new Exception("devices wrong:\n" + json);
+                var rows = ((System.Collections.IEnumerable)J.Get(devicesList[1], "agents", "codex")).Cast<object>().ToList();
+                if (rows.Count != 2 || J.Str(rows[0], "hourUtc") != "2026-10-05T10:00:00Z" || J.Num(rows[0], "inputTokens") != 100 || J.Str(J.Get(rows[0], "endpoint")) != "hostA/x" || J.Get(rows[1], "endpoint") != null || J.Str(rows[1], "model") != "plain") throw new Exception("hour rows wrong:\n" + json);
+                var days = ((System.Collections.IEnumerable)J.Get(root, "days")).Cast<object>().ToList();
+                if (days.Count != 1 || J.Str(days[0], "day") != "2026-10-05" || J.Num(days[0], "costUsd") != 2.25 || J.Num(days[0], "timedSeconds") != 4) throw new Exception("days wrong:\n" + json);
+            });
+            test("Phase 4.1: CLI export --format csv|json|sql, default sql, unknown format fails", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cu-p4cli-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    string csv = Path.Combine(dir, "out.csv"), json = Path.Combine(dir, "out.json"), sql = Path.Combine(dir, "out.sql"), legacy = Path.Combine(dir, "legacy.sql");
+                    Require(CliProgram.Main(new[] { "export", csv, "--format", "csv" }) == 0 && File.ReadAllText(csv).StartsWith("granularity,"));
+                    Require(CliProgram.Main(new[] { "export", json, "--format", "json" }) == 0 && J.Parse(File.ReadAllText(json)) != null && File.ReadAllText(json).Contains("\"devices\""));
+                    Require(CliProgram.Main(new[] { "export", sql, "--format", "sql" }) == 0 && File.ReadAllText(sql).StartsWith("-- codeusagemonit usage export"));
+                    Require(CliProgram.Main(new[] { "export", legacy }) == 0 && File.ReadAllText(legacy).StartsWith("-- codeusagemonit usage export"));   // 默认 sql 兼容
+                    Require(CliProgram.Main(new[] { "export", Path.Combine(dir, "x"), "--format", "yaml" }) == 2);
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 4.2: heatmap folds hourly buckets into a 12-week day calendar", () => {
+                DateTime now = new DateTime(2026, 10, 7, 12, 30, 0, DateTimeKind.Utc);   // 周三
+                var index = new LogIndex();
+                index.Files.Add(new LogFile { Name = "a.jsonl", Hours = {
+                    { LogIndex.BucketKey(new DateTime(2026, 9, 28, 10, 0, 0, DateTimeKind.Utc), "openai", "m"), new Bucket { I = 100, R = 2 } },  // 09-28 周一
+                    { LogIndex.BucketKey(new DateTime(2026, 9, 28, 22, 0, 0, DateTimeKind.Utc), "openai", "m"), new Bucket { I = 25, R = 1 } },   // 同一天第二个桶 → 折进同一格
+                    { LogIndex.BucketKey(new DateTime(2026, 10, 1, 18, 0, 0, DateTimeKind.Utc), "openai", "m"), new Bucket { I = 40, R = 1 } },   // 10-01 18Z → 北京时间 10-02 02:00
+                    { LogIndex.BucketKey(now.AddDays(-98), "openai", "m"), new Bucket { I = 999, R = 1 } }                                        // 12 周窗口外
+                } });
+                // 周首为周日：窗口 = 2026-07-19（周日）起 84 天，09-28 是第 71 格、10-01 第 74 格。
+                ActivityHeat cal = ActivityHeat.Calendar(new[] { index }, now, TimeZoneInfo.Utc, DayOfWeek.Sunday);
+                Require(cal.Days.Count == 84 && cal.Start == new DateTime(2026, 7, 19) && cal.Today == new DateTime(2026, 10, 7));
+                Require(cal.Days[71].Tokens == 125 && cal.Days[71].Requests == 3);      // 同日多桶聚合
+                Require(cal.Days[74].Tokens == 40);
+                Require(cal.Days.Where(d => d.Tokens > 0).Sum(d => d.Tokens) == 165);   // 窗口外的 999 不计入
+                Require(cal.Days[0].Tokens == 0 && cal.Days[83].Tokens == 0);           // 空日与未来日保留为零
+                // 跨时区：22Z 与 18Z 的桶 +8h 后各自跨到次日（09-29 / 10-02），同日桶才折叠。
+                TimeZoneInfo china = TimeZones.Find("China Standard Time");
+                ActivityHeat local = ActivityHeat.Calendar(new[] { index }, now, china, DayOfWeek.Sunday);
+                Require(local.Days[71].Tokens == 100 && local.Days[72].Tokens == 25 && local.Days[75].Tokens == 40);
+                ActivityHeat monday = ActivityHeat.Calendar(new[] { index }, now, TimeZoneInfo.Utc, DayOfWeek.Monday);
+                Require(monday.Start == new DateTime(2026, 7, 20) && monday.Days[70].Tokens == 125);
+                Require(ActivityHeat.Calendar(new LogIndex[0], now, TimeZoneInfo.Utc, DayOfWeek.Sunday).Days.Count == 84);
+            });
+            test("Phase 4.3: status whitelist is https-only, exact-host, and rejects private or reserved addresses", () => {
+                Require(ServiceStatus.SourceOf("https://status.openai.com/api/v2/status.json") != null);
+                Require(ServiceStatus.SourceOf("https://STATUS.OPENAI.com/api/v2/status.json") != null);          // host 大小写不敏感
+                Require(ServiceStatus.SourceOf("http://status.openai.com/api/v2/status.json") == null);            // 明文拒绝
+                Require(ServiceStatus.SourceOf("https://status.openai.com.evil.com/api/v2/status.json") == null);  // 子域伪装拒绝
+                Require(ServiceStatus.SourceOf("https://evil-openai.com/api/v2/status.json") == null);
+                Require(ServiceStatus.SourceOf("https://u:p@status.openai.com/api/v2/status.json") == null);       // userinfo 拒绝
+                Require(ServiceStatus.Check("https://status.claude.com/api/v2/status.json") == null);
+                foreach (string bad in new[] { "https://127.0.0.1/api/v2/status.json", "https://localhost/api/v2/status.json", "https://10.0.0.9/api/v2/status.json", "https://192.168.1.5/api/v2/status.json", "https://172.16.0.1/api/v2/status.json", "https://169.254.1.1/api/v2/status.json", "https://100.64.0.1/api/v2/status.json", "https://198.18.0.9/api/v2/status.json", "https://224.0.0.1/api/v2/status.json", "https://[::1]/api/v2/status.json", "https://[fe80::1]/api/v2/status.json", "https://[fd00::1]/api/v2/status.json", "https://status.openai.com.local/api/v2/status.json" })
+                    if (ServiceStatus.Check(bad) == null) throw new Exception("should reject " + bad);
+                Require(ServiceStatus.Level("none") == "ok" && ServiceStatus.Level("minor") == "warn" && ServiceStatus.Level("maintenance") == "warn" && ServiceStatus.Level("major") == "down" && ServiceStatus.Level("critical") == "down");
+                Require(ServiceStatus.Sources.Any(s => s.Id == "claude" && s.Host == "status.claude.com") && ServiceStatus.Sources.All(s => s.Host.StartsWith("status.") || s.Host.StartsWith("www.")) && ServiceStatus.Sources.Length == 5);
+            });
+            test("Phase 4.4: CAS conflict merges the remote copy first, then retries the upload (mock WebDAV)", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cu-p4cas-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow, hour = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    string url = "https://dav.test/folder", devices = url + "/devices/";
+                    string selfId = Devices.Self().Id;
+                    string remoteSql = "INSERT OR REPLACE INTO cum_devices (device_id, name, exported_utc, app_version) VALUES ('otherde', 'Other', '" + now.AddHours(-2).ToString("o") + "', '1.0');\n" +
+                        "INSERT OR REPLACE INTO cum_usage_hours (device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds) VALUES " +
+                        "('otherde', 'codex', '" + hour.ToString("yyyy-MM-ddTHH:00:00Z", CultureInfo.InvariantCulture) + "', 'openai', 'm', NULL, 100, 0, 0, 10, 0, 1, 0.5, 0, 0, 0, 0);\n";
+                    var dav = new FakeDav(url);
+                    dav.Put(devices + "otherde.sql", "{}\n", "\"other1\"");                 // 一台其他设备，验证下载合并照常
+                    dav.Put(devices + selfId + ".sql", remoteSql, "\"old1\"");              // 冲突源：远端本机文件（内容含旧版多合一的其他设备行）
+                    Store.Write("sync-state.json", new SyncState { Last = now.ToString("o"), Ok = true, BaselineUrl = url, Baseline = "\"stale1\"|Mon, 05 Oct 2026 10:00:00 GMT" });
+                    SyncOutcome outcome = WebDavSync.RunDetailed(new AppConfig(), url, "u", "p", now, dav).GetAwaiter().GetResult();
+                    Require(outcome.Conflicted && outcome.Message.Contains(I18n.T("；远端本机文件已被更新过，已先合并再上传")));
+                    Require(dav.Puts == 1);
+                    // 远端旧文件里的其他设备行在被覆盖前合并进了本地设备库。
+                    DeviceData foreign = Devices.Imported().First(d => d.Id == "otherde");
+                    Require(foreign.Agents["codex"].Values.First().I == 100);
+                    WebDavSync.Record(true, outcome.Message, now, outcome);
+                    SyncState saved = WebDavSync.State();
+                    Require(saved.Baseline.Length > 0 && saved.Baseline == dav.EtagOf(devices + selfId + ".sql") + "|" + dav.ModifiedOf(devices + selfId + ".sql"));
+                    // 第二轮：远端戳未变 → 不冲突、只上传一次；Record 落盘新基线。
+                    SyncOutcome second = WebDavSync.RunDetailed(new AppConfig(), url, "u", "p", now.AddMinutes(5), dav).GetAwaiter().GetResult();
+                    Require(!second.Conflicted && dav.Puts == 2);
+                    WebDavSync.Record(true, second.Message, now.AddMinutes(5), second);
+                    // 412 竞态：探测之后、上传之前远端又被写 → 下载合并 + 重试一次成功。
+                    dav.RaceOnce = true;
+                    SyncOutcome third = WebDavSync.RunDetailed(new AppConfig(), url, "u", "p", now.AddMinutes(10), dav).GetAwaiter().GetResult();
+                    Require(third.Conflicted && dav.Puts == 4);   // 本轮 2 次 PUT（首次 412 + 重试）+ 前两轮各 1 次
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 4.5a: a restored install keeps its device id (device.json rides in backups)", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cu-p4id-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    Store.Write("device.json", new DeviceIdentity { Id = "keepid123", Name = "M" });
+                    var config = new AppConfig { BackupKeep = 2 };
+                    string zip = Backups.Create(config, false, DateTime.UtcNow);
+                    File.Delete(Path.Combine(dir, "device.json"));
+                    Require(Devices.Self().Id != "keepid123");   // 没有 device.json 时会再生新 id（旧行为）
+                    Backups.Restore(config, zip, DateTime.UtcNow.AddSeconds(5));
+                    Require(Devices.Self().Id == "keepid123");   // 恢复后回到原 id：不会以新 id 重传全量
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 4.5b: Attach compares endpoint-split buckets group by group, not per bucket", () => {
+                var local = new Dictionary<string, LogIndex>();
+                var index = new LogIndex();
+                index.Files.Add(new LogFile { Name = "a.jsonl", Hours = {
+                    { "2026100510|openai|m|ep1", new Bucket { I = 50, R = 1 } },
+                    { "2026100510|openai|m|ep2", new Bucket { I = 50, R = 1 } } } });
+                local["codex"] = index;
+                Func<double, double, DeviceData> remote = (a, b) => {
+                    var d = new DeviceData { Id = "aaaa11", Name = "R" };
+                    d.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) {
+                        { "2026100510|openai|m|hostA/x", new Bucket { I = a, R = 1 } },
+                        { "2026100510|openai|m|hostB/y", new Bucket { I = b, R = 1 } } };
+                    return d;
+                };
+                // 远端把同组拆成两个 endpoint（50+50 = 本机 100）：整组丢弃，不再按桶比较各留一半。
+                var attached = Devices.Attach(local, new List<DeviceData> { remote(50, 50) });
+                Require(attached["codex"].Files.Count == 1 && !attached["codex"].Files.Any(Devices.IsImported));
+                // 远端总量不同（60+50 = 110 ≠ 100）：保留全部远端桶。
+                var attached2 = Devices.Attach(local, new List<DeviceData> { remote(60, 50) });
+                LogFile kept = attached2["codex"].Files.First(Devices.IsImported);
+                Require(kept.Hours.Count == 2 && kept.Hours.Values.Sum(b => b.I) == 110);
+                // 无 endpoint 的远端单桶同样按组比较。
+                var single = new DeviceData { Id = "aaaa11", Name = "R" };
+                single.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) { { "2026100510|openai|m", new Bucket { I = 100, R = 2 } } };
+                var attached3 = Devices.Attach(local, new List<DeviceData> { single });
+                Require(attached3["codex"].Files.Count == 1);
+            });
+            test("Phase 4.5c: orphan buckets of a re-partitioned hour are recycled; an older export never recycles", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cu-p4rec-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow, hour = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    string h = hour.ToString("yyyyMMddHH", CultureInfo.InvariantCulture), iso = hour.ToString("yyyy-MM-ddTHH:00:00Z", CultureInfo.InvariantCulture);
+                    var stored = new DeviceData { Id = "bbbb22", Name = "R2", Exported = now.AddHours(-30).ToString("o") };
+                    stored.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) {
+                        { h + "|openai|m|oldhost/fp", new Bucket { I = 100, R = 2 } } };
+                    Directory.CreateDirectory(Path.Combine(dir, "devices"));
+                    Store.Write(Path.Combine("devices", "bbbb22.json"), stored);
+                    Func<string, string, string> sql = (exported, endpoint) =>
+                        "INSERT OR REPLACE INTO cum_devices (device_id, name, exported_utc, app_version) VALUES ('bbbb22', 'R2', '" + exported + "', '1.0');\n" +
+                        "INSERT OR REPLACE INTO cum_usage_hours (device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds) VALUES " +
+                        "('bbbb22', 'codex', '" + iso + "', 'openai', 'm', " + (endpoint == null ? "NULL" : "'" + endpoint + "'") + ", 120, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0);\n";
+                    // 较新的导出（远端已按新 endpoint 重划）：旧 key 回收，新 key 落位，不双计。
+                    Devices.ImportSql(sql(now.AddHours(-2).ToString("o"), "newhost/fp"), now);
+                    DeviceData after = Devices.Imported().First(d => d.Id == "bbbb22");
+                    var keys = new List<string>(after.Agents["codex"].Keys);
+                    Require(keys.SequenceEqual(new[] { h + "|openai|m|newhost/fp" }) && after.Agents["codex"].Values.First().I == 120);
+                    // 更旧的导出（只带另一个 key）：守则拦下回收，新 key 原样保留、旧值不被回退。
+                    Devices.ImportSql(sql(now.AddHours(-40).ToString("o"), "ancient/fp"), now.AddMinutes(1));
+                    DeviceData guarded = Devices.Imported().First(d => d.Id == "bbbb22");
+                    Require(guarded.Agents["codex"].ContainsKey(h + "|openai|m|newhost/fp") && guarded.Agents["codex"].ContainsKey(h + "|openai|m|ancient/fp"));
+                    // 重放同一份新导出：键集一致，回收为无操作（幂等）。
+                    Devices.ImportSql(sql(now.AddHours(-2).ToString("o"), "newhost/fp"), now.AddMinutes(2));
+                    DeviceData replay = Devices.Imported().First(d => d.Id == "bbbb22");
+                    Require(replay.Agents["codex"].ContainsKey(h + "|openai|m|newhost/fp"));
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            // ── Phase 4 初审修正单（P1-1 / P2-1 / P2-3 / P3）──
+            test("Phase 4 P1-1: a weak-ETag server degrades to a bare PUT instead of failing forever", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cu-p4weak-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow;
+                    string url = "https://dav.test/folder", devices = url + "/devices/";
+                    string selfId = Devices.Self().Id;
+                    string remoteSql = "INSERT OR REPLACE INTO cum_devices (device_id, name, exported_utc, app_version) VALUES ('otherde', 'Other', '" + now.AddHours(-2).ToString("o") + "', '1.0');\n" +
+                        "INSERT OR REPLACE INTO cum_usage_hours (device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds) VALUES " +
+                        "('otherde', 'codex', '" + now.AddHours(-5).ToString("yyyy-MM-ddTHH:00:00Z", CultureInfo.InvariantCulture) + "', 'openai', 'm', NULL, 100, 0, 0, 10, 0, 1, 0.5, 0, 0, 0, 0);\n";
+                    // 场景一：有过期基线 + 弱 ETag。旧代码把 W/"…" 原文作 If-Match，强比较永不
+                    // 匹配 → 412 → 合并重试仍 412 → 抛异常永久硬失败；新代码剥前缀仍被弱服务器
+                    // 拒绝后降级裸 PUT，三次尝试内成功且合并过远端旧文件。
+                    var dav = new FakeDav(url) { WeakEtags = true };
+                    dav.Put(devices + selfId + ".sql", remoteSql, "\"old1\"");
+                    Store.Write("sync-state.json", new SyncState { Last = now.ToString("o"), Ok = true, BaselineUrl = url, Baseline = "\"stale1\"|Mon, 05 Oct 2026 10:00:00 GMT" });
+                    SyncOutcome outcome = WebDavSync.RunDetailed(new AppConfig(), url, "u", "p", now, dav).GetAwaiter().GetResult();
+                    if (dav.Puts != 3 || !outcome.Conflicted || outcome.Baseline.Length == 0 || !outcome.Message.Contains(I18n.T("；远端本机文件已被更新过，已先合并再上传")))
+                        throw new Exception("scenario 1 wrong: Puts=" + dav.Puts + " conflicted=" + outcome.Conflicted + " baseline=" + outcome.Baseline + " msg=" + outcome.Message);
+                    Require(Devices.Imported().Any(d => d.Id == "otherde"));   // 覆盖前旧文件里的其他设备行已合并
+                    // 场景二：无基线的首轮（多数弱 ETag 服务器的常态）同样走通，不抛异常；
+                    // 远端没有被真写过 → 不虚报冲突。（先清掉场景一留下的过期基线。）
+                    File.Delete(Path.Combine(dir, "sync-state.json"));
+                    var dav2 = new FakeDav(url) { WeakEtags = true };
+                    dav2.Put(devices + selfId + ".sql", remoteSql, "\"old1\"");
+                    SyncOutcome first = WebDavSync.RunDetailed(new AppConfig(), url, "u", "p", now.AddMinutes(5), dav2).GetAwaiter().GetResult();
+                    if (dav2.Puts != 3 || first.Conflicted || first.Baseline.Length == 0)
+                        throw new Exception("scenario 2 wrong: Puts=" + dav2.Puts + " conflicted=" + first.Conflicted + " baseline=" + first.Baseline + " msg=" + first.Message);
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 4 P2-1: CSV cells starting with = + - @ are neutralized with a leading apostrophe", () => {
+                var bundle = new Devices.ExportBundle { Self = new DeviceIdentity { Id = "self01", Name = "M" } };
+                var remote = new DeviceData { Id = "aaaa11", Name = "R" };
+                remote.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) {
+                    { "2026100510|openai|=cmd|e", new Bucket { I = 10, R = 1 } },
+                    { "2026100511|openai|-sum(A1)|e", new Bucket { I = 20, R = 1 } },
+                    { "2026100512|openai|@x|e", new Bucket { I = 30, R = 1 } } };
+                bundle.Devices.Add(remote);
+                string csv = Devices.ExportCsv(bundle);
+                Require(csv.Contains("'=cmd") && csv.Contains("'-sum(A1)") && csv.Contains("'@x"));
+                Require(!csv.Contains(",=cmd,") && !csv.Contains(",-sum(A1),") && !csv.Contains(",@x,"));
+            });
+            test("Phase 4 P2-3: a row refused for a bad number still reserves its key from recycling", () => {
+                string dir = Path.Combine(Path.GetTempPath(), "cu-p4skip-" + Guid.NewGuid().ToString("N"));
+                string previous = Store.SwapData(dir);
+                try {
+                    DateTime now = DateTime.UtcNow, hour = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc).AddHours(-5);
+                    string h = hour.ToString("yyyyMMddHH", CultureInfo.InvariantCulture), iso = hour.ToString("yyyy-MM-ddTHH:00:00Z", CultureInfo.InvariantCulture);
+                    var stored = new DeviceData { Id = "cccc33", Name = "R3", Exported = now.AddHours(-30).ToString("o") };
+                    stored.Agents["codex"] = new Dictionary<string, Bucket>(StringComparer.Ordinal) { { h + "|openai|m|hostA", new Bucket { I = 100, R = 2 } } };
+                    Directory.CreateDirectory(Path.Combine(dir, "devices"));
+                    Store.Write(Path.Combine("devices", "cccc33.json"), stored);
+                    string columns = "device_id, agent, hour_utc, provider, model, endpoint, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, other_tokens, requests, cost_usd, unpriced_tokens, timed_requests, timed_output_tokens, timed_seconds";
+                    // 新导出两行：hostB 合法；hostA 的 input_tokens 是 1e999（非有限数被拒）。
+                    string sql = "INSERT OR REPLACE INTO cum_devices (device_id, name, exported_utc, app_version) VALUES ('cccc33', 'R3', '" + now.AddHours(-2).ToString("o") + "', '1.0');\n" +
+                        "INSERT OR REPLACE INTO cum_usage_hours (" + columns + ") VALUES ('cccc33', 'codex', '" + iso + "', 'openai', 'm', 'hostB', 50, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0),\n" +
+                        "('cccc33', 'codex', '" + iso + "', 'openai', 'm', 'hostA', 1e999, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0);\n";
+                    ImportResult result = Devices.ImportSql(sql, now);
+                    Require(result.Skipped == 1 && result.Rows == 1);
+                    DeviceData after = Devices.Imported().First(d => d.Id == "cccc33");
+                    // 被拒行的键仍占位：hostA 的旧桶不被回收，留给下一个好导出刷新。
+                    Require(after.Agents["codex"].ContainsKey(h + "|openai|m|hostA") && after.Agents["codex"].ContainsKey(h + "|openai|m|hostB"));
+                } finally { Store.SwapData(previous); try { Directory.Delete(dir, true); } catch { } }
+            });
+            test("Phase 4 P3: the status cache merges per source instead of shrinking to the fresh batch", () => {
+                DateTime now = DateTime.UtcNow;
+                Func<string, string, string, ServiceStatus.Reading> reading = (id, desc, checkedIso) => new ServiceStatus.Reading { Id = id, Name = id, Page = "https://example.com", Indicator = "none", Description = desc, Checked = checkedIso, Ok = true };
+                var cached = new ServiceStatus.Cache { Updated = now.AddHours(-1).ToString("o"), Readings = {
+                    reading("claude", "old", now.AddHours(-2).ToString("o")),
+                    reading("codex", "stale", now.AddDays(-8).ToString("o")),       // 超 7 天：丢弃
+                    reading("gone", "removed", now.ToString("o")) } };              // 白名单外：丢弃
+                var fresh = new List<ServiceStatus.Reading> { reading("claude", "new", now.ToString("o")), reading("cursor", "new", now.ToString("o")) };
+                ServiceStatus.Cache merged = ServiceStatus.Merge(cached, fresh, now);
+                Require(merged.Readings.Count == 2 && merged.Readings[0].Id == "claude" && merged.Readings[0].Description == "new" && merged.Readings[1].Id == "cursor");
+                Require(merged.Updated == now.ToString("o"));
+                // 全部失败：缓存原样保留（时间戳不动，Stale 会再触发重试），不缩水也不清空。
+                ServiceStatus.Cache kept = ServiceStatus.Merge(cached, new List<ServiceStatus.Reading>(), now);
+                Require(kept.Updated == cached.Updated && kept.Readings.Any(r => r.Id == "claude" && r.Description == "old") && !kept.Readings.Any(r => r.Id == "codex" || r.Id == "gone"));
+            });
+            // Desktop 侧补充用例（无头 UI 构建 / 排序口径等）：与 Core 用例同清单计数。
+            if (DesktopTestSource != null) foreach (var pair in DesktopTestSource()) test(pair.Key, pair.Value);
+            Directory.CreateDirectory(Path.Combine(Store.Root, "verification"));
+            File.WriteAllText(Path.Combine(Store.Root, "verification", "tests.json"), J.Serializer().Serialize(new { passed = passed.Count, failed = failed.Count, checks = passed, errors = failed }));
+            return failed.Count == 0 ? 0 : 1;
+        }
+        private static void Require(bool value, [System.Runtime.CompilerServices.CallerLineNumber] int line = 0) { if (!value) throw new Exception("Assertion failed @" + line); }
+
+        // 内存 WebDAV（Phase 4.4 自测）：只实现 RunDetailed 用到的原语，按 URL 存内容与戳，
+        // 复现「探测 → 基线不符 / If-Match 412 → 下载合并 → 重试上传」，不发起网络请求。
+        private sealed class FakeDav : WebDavSync.SyncTransport {
+            private readonly string root;
+            private readonly Dictionary<string, string> files = new Dictionary<string, string>(StringComparer.Ordinal);
+            private readonly Dictionary<string, string> etags = new Dictionary<string, string>(StringComparer.Ordinal);
+            private readonly Dictionary<string, string> modified = new Dictionary<string, string>(StringComparer.Ordinal);
+            private int counter;
+            public int Puts; public bool RaceOnce;
+            // 弱 ETag 服务器（Phase 4 初审 P1-1）：对外戳带 W/ 前缀；按 RFC 7232 强比较，
+            // 任何 If-Match 对弱实体标记都判失败 → 一律 412，只有裸 PUT 能成功。
+            public bool WeakEtags;
+            public FakeDav(string root) { this.root = root; }
+            public string EtagOf(string url) { string e; return etags.TryGetValue(url, out e) ? e : ""; }
+            public string ModifiedOf(string url) { string m; return modified.TryGetValue(url, out m) ? m : ""; }
+            public string Wire(string etag) { return WeakEtags && etag.Length > 0 ? "W/" + etag : etag; }
+            public void Put(string url, string content, string etag) { files[url] = content; etags[url] = etag; modified[url] = "Mon, 05 Oct 2026 10:00:00 GMT"; }
+            public override HttpClient Client(AppConfig config, string user, string password) { return new HttpClient(); }
+            private static string Resp(string path, string etag, string modified) {
+                return "<d:response><d:href>" + path + "</d:href><d:propstat><d:prop><d:getetag>" + etag + "</d:getetag><d:getlastmodified>" + modified + "</d:getlastmodified></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>";
+            }
+            private HttpResponseMessage Text(HttpStatusCode code, string body, string type) {
+                var response = new HttpResponseMessage(code) { Content = new StringContent(body, Encoding.UTF8, type) };
+                return response;
+            }
+            public override System.Threading.Tasks.Task<HttpResponseMessage> SendAsync(HttpClient client, string method, string url, string body, string depth, string ifMatch) {
+                string path = new Uri(url).AbsolutePath;
+                if (method == "PROPFIND") {
+                    if (depth == "1") {
+                        var listing = new StringBuilder("<?xml version=\"1.0\" encoding=\"utf-8\"?><d:multistatus xmlns:d=\"DAV:\">").Append(Resp(path.TrimEnd('/'), "", ""));
+                        foreach (string key in files.Keys.OrderBy(k => k, StringComparer.Ordinal))
+                            if (key.StartsWith(root + "/devices/", StringComparison.Ordinal)) listing.Append(Resp(new Uri(key).AbsolutePath, Wire(EtagOf(key)), ModifiedOf(key)));
+                        listing.Append("</d:multistatus>");
+                        return System.Threading.Tasks.Task.FromResult(Text(HttpStatusCode.MultiStatus, listing.ToString(), "application/xml"));
+                    }
+                    string etag;
+                    if (files.ContainsKey(url) && etags.TryGetValue(url, out etag)) return System.Threading.Tasks.Task.FromResult(Text(HttpStatusCode.MultiStatus, "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:multistatus xmlns:d=\"DAV:\">" + Resp(path, Wire(etag), ModifiedOf(url)) + "</d:multistatus>", "application/xml"));
+                    return System.Threading.Tasks.Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                }
+                if (method == "GET") {
+                    string content;
+                    if (!files.TryGetValue(url, out content)) return System.Threading.Tasks.Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                    return System.Threading.Tasks.Task.FromResult(Text(HttpStatusCode.OK, content, "application/sql"));
+                }
+                if (method == "PUT") {
+                    Puts++;
+                    string current;
+                    if (ifMatch != null && (WeakEtags || !etags.TryGetValue(url, out current) || current != ifMatch)) return System.Threading.Tasks.Task.FromResult(new HttpResponseMessage(HttpStatusCode.PreconditionFailed));
+                    if (RaceOnce) {   // 模拟探测与上传之间另一次写入：写入方先落盘，PUT 得到 412
+                        RaceOnce = false;
+                        files[url] = body ?? ""; etags[url] = "\"race" + (++counter) + "\""; modified[url] = "Tue, 06 Oct 2026 11:00:00 GMT";
+                        return System.Threading.Tasks.Task.FromResult(new HttpResponseMessage(HttpStatusCode.PreconditionFailed));
+                    }
+                    files[url] = body ?? "";
+                    string fresh = "\"e" + (++counter) + "\"";
+                    etags[url] = fresh; modified[url] = "Tue, 06 Oct 2026 11:00:00 GMT";
+                    var created = new HttpResponseMessage(HttpStatusCode.Created);
+                    created.Headers.TryAddWithoutValidation("ETag", Wire(fresh));
+                    return System.Threading.Tasks.Task.FromResult(created);
+                }
+                return System.Threading.Tasks.Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));   // MKCOL 等
+            }
+        }
+    }
+}

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 代码未使用可空引用类型标注；禁用以避免海量警告、保持构建输出干净。 -->
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 自测隔离缝：开放 internal 给 Desktop 程序集，UiSelfTests 才能用 Store.SwapData
+         隔离数据目录、Keychain.RunOverride 合成钥匙串（两者 internal，环境变量覆盖口
+         在 Store.Data 已被解析后不生效）。注意 friend 是 Desktop 的 AssemblyName 覆盖值
+         「codeusagemonit」，不是项目名 CodeUsageMonit.Desktop。仅供无头自测使用，
+         Desktop 生产代码不得依赖 Core internal。 -->
+    <InternalsVisibleTo Include="codeusagemonit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 与 exe 同目录的内置价目表（Pricing.EnsureLoaded 读 Store.Root/pricing.json）。 -->
+    <None Include="pricing.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
