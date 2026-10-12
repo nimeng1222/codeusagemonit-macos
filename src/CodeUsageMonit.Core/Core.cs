@@ -71,7 +71,7 @@ namespace CodeUsageMonit {
         public int RefreshMinutes = 5;
         public bool PinWindow = false;
         public bool HideAccounts = true;
-        public string[] Enabled = ProviderCatalog.DefaultEnabled;
+        public string[] Enabled = (string[])ProviderCatalog.DefaultEnabled.Clone();
         public int UiVersion;
         public bool AlwaysOnTop = false;
         public bool HideOnDeactivate = false;
@@ -135,6 +135,8 @@ namespace CodeUsageMonit {
     public static class ProviderCatalog {
         public static readonly string[] Ids = { "codex", "claude", "cursor", "antigravity", "deepseek", "grok", "copilot", "kimi", "opencode", "zcode", "pi", "mimo", "stepfun" };
         // New installs start with the original six; the rest are opt-in in Settings.
+        // 共享的 static readonly 数组：赋给任何 config.Enabled 都必须 Clone（各消费点见
+        // AppConfig 字段初始化器 / Cli / AppMonitor / Settings），否则全部实例别名同一数组。
         public static readonly string[] DefaultEnabled = { "codex", "claude", "cursor", "antigravity", "deepseek", "grok" };
         // Not a quota provider: a page of usage that went through third-party endpoints.
         public const string ThirdParty = "thirdparty";
@@ -172,7 +174,7 @@ namespace CodeUsageMonit {
                 case "opencode": return "OpenCode Go 订阅：填写 OpenCode API Key，或设置环境变量 OPENCODE_API_KEY。";
                 case "zcode": return "填写智谱 / Z.ai 的 API Key（GLM 编码套餐），或设置环境变量 Z_AI_API_KEY。";
                 case "pi": return "Pi 没有账户额度，这里只统计本机日志中的用量。";
-                case "mimo": return "登录小米 MiMo 开放平台控制台（platform.xiaomimimo.com）后，从浏览器复制完整 Cookie 粘贴到这里（需包含 api-platform_serviceToken 与 userId），也可设置环境变量 MIMO_COOKIE。";
+                case "mimo": return "已登录小米 MiMo 桌面客户端时自动续期凭据，无需手动操作；也可在浏览器登录 MiMo 控制台（platform.xiaomimimo.com）后复制完整 Cookie 粘贴到这里（需包含 api-platform_serviceToken 与 userId），或设置环境变量 MIMO_COOKIE。";
                 case "stepfun": return "填写阶跃星辰 StepFun 开放平台的 Oasis-Token（platform.stepfun.ai 国际站 / platform.stepfun.com 国内站），或设置环境变量 STEPFUN_TOKEN。";
                 default: return "";
             }
@@ -757,6 +759,12 @@ namespace CodeUsageMonit {
         // ——带错 appid 携有效 token 请求会被平台判为盗用（embezzled）。
         // token 各段 JWT payload 里带 app_id claim，优先从 token 自身提取；提取不到按区域回退。
         public static string StepFunAppId(string token, string region) {
+            string extracted = StepFunTokenAppId(token);
+            if (extracted.Length > 0) return extracted;
+            return region == "china" ? "10300" : "20700";
+        }
+        // 从 token 各段 JWT payload 提取 app_id；提取不到返回空串（调用方按区域回退）。
+        public static string StepFunTokenAppId(string token) {
             if (!String.IsNullOrWhiteSpace(token)) {
                 foreach (string part in token.Split(new[] { "..." }, StringSplitOptions.None)) {
                     object payload = J.Jwt(part);
@@ -764,10 +772,13 @@ namespace CodeUsageMonit {
                     if (appId.HasValue && appId.Value > 0) return ((long)appId.Value).ToString(CultureInfo.InvariantCulture);
                 }
             }
-            return region == "china" ? "10300" : "20700";
+            return "";
         }
         // 接口区域 → 官方域名：默认国际站；只允许这两个 host（ProviderService.CloudRequest 把关）。
         public static string StepFunHost(string region) { return region == "china" ? "https://platform.stepfun.com" : "https://platform.stepfun.ai"; }
+        // appid → 官方域名：10300 是国内站应用，其余（含 20700 与未知值）都落国际站。
+        // token 自带 app_id 时站点由它决定，与用户配置的区域无关。
+        public static string StepFunHostForAppId(string appId) { return appId == "10300" ? "https://platform.stepfun.com" : "https://platform.stepfun.ai"; }
         // StepFun 信封：status===1 成功（payload 可能在 data 下，也可能就在根上）；
         // status!==1 时 message/desc 命中认证类关键词 → 未授权，其余 → 服务不可用。
         // 关键词只收明确的鉴权失效信号：裸 "token" 会误命中限额等普通业务文案
@@ -1008,11 +1019,26 @@ namespace CodeUsageMonit {
                         s = Parsers.Zai(await KeyedRequest(id, host + "/api/monitor/usage/quota/limit", key, null).ConfigureAwait(false)); break;
                     }
                     case "mimo": {
+                        // 凭据链：桌面客户端换票（每 tick 现铸、不落盘）→ 钥匙串手动 Console Cookie
+                        // → 都没有才报 setup。换票不可用（客户端未装/未登录/加密存储/被拒）一律
+                        // 回退手动路径，行为与旧版一致。
+                        string cookie = null;
+                        string[] stores = MimoDesktop.StoreCandidates(Home);
+                        if (stores.Length > 0) {
+                            // 15 秒总时限覆盖整个逐候选循环（本地读库 + 每条候选各一次换票）。
+                            using (var deadline = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(15))) {
+                                System.Threading.CancellationToken token = deadline.Token;
+                                try { cookie = await MimoDesktopCookie(stores, (hop, hopDeadline) => MimoExchangeHop(hop, hopDeadline), token).ConfigureAwait(false); } catch { }
+                            }
+                        }
+                        bool automatic = cookie != null;
+                        if (!automatic) {
+                            string raw = Store.ProviderKey(id, config); Need(raw, id);
+                            cookie = Parsers.MimoCookie(raw);
+                        }
                         // Console Cookie 通道：/balance（钱包+探活）→ 账户 / 套餐 / 月度用量 →
                         // 消费金额探测。账户、套餐、消费三处失败不拖垮读数，但未授权（expired）
                         // 任何一处出现都要浮出——Cookie 失效不该被「部分成功」掩盖。
-                        string raw = Store.ProviderKey(id, config); Need(raw, id);
-                        string cookie = Parsers.MimoCookie(raw);
                         s = new ProviderState { Id = id, Plan = "MiMo" };
                         Parsers.MimoWallet(s, await MiMoGet("/balance", cookie).ConfigureAwait(false));
                         try { s.Account = Parsers.MimoAccount(await MiMoGet("/userProfile", cookie).ConfigureAwait(false)); } catch (ProviderException e) { if (e.State == "expired") throw; }
@@ -1022,20 +1048,59 @@ namespace CodeUsageMonit {
                         // 消费金额端点：金额暂不展示（钱包余额已进 Balances），失败可容忍；
                         // 仍探活以便 Cookie 失效在这里同样暴露。
                         try { await MiMoGet("/usage", cookie).ConfigureAwait(false); } catch (ProviderException e) { if (e.State == "expired") throw; }
+                        // 状态区分凭据来源（与 CredentialPanel 的「已连接 · <套餐>」胶囊同口径）。
+                        if (automatic) s.Plan += " · 自动续期（桌面客户端）";
                         break;
                     }
                     case "stepfun": {
-                        // Oasis-Token 通道：QueryStepPlanRateLimit（额度，必需）→ GetStepPlanStatus
-                        // （套餐名，短超时可吞）。区域错配（token 属于另一站）会被平台判成过期，
-                        // 由 StepFunChannel 自动换区域重试并把可用区域写回配置。
+                        // Oasis-Token 通道：先按需滚动刷新（access 剩余 <30 分钟时走 RefreshToken
+                        // 端点换新对并写回钥匙串，见 StepFunAuth），再 QueryStepPlanRateLimit（额度，
+                        // 必需）→ GetStepPlanStatus（套餐名，短超时可吞）。token 自带 app_id 时站点
+                        // 由它锁定，不做跨站重试（StepFunChannel）；appid 提取失败才按区域回退、
+                        // expired 换站重试。请求仍被拒（401/expired）时兜底强制刷新一次再试——
+                        // 覆盖 access 被服务端提前作废的场景；刷新判死（匿名令牌/refresh 过期）
+                        // 直接走现有 expired 文案，不无限重试。
                         string raw = Store.ProviderKey(id, config); Need(raw, id);
                         string token = Parsers.StepFunToken(raw);
                         if (token.Length == 0) throw new ProviderException("Oasis-Token 无法识别：请粘贴纯 Token 或整段 Oasis-Token=… Cookie。", "setup");
-                        s = await StepFunChannel(token, config.StepfunRegion, StepFunPost, region => {
-                            config.StepfunRegion = region;
-                            // 与 Connect 的区域切换同款持久化：写失败不拖垮本次已到手的读数。
-                            try { Store.Write("settings.json", config); } catch { }
-                        }).ConfigureAwait(false);
+                        // env 来的 token 不落钥匙串：轮换只在内存生效，下次读取仍以 env 为准。
+                        bool persistable = Store.KeyEnvironmentName(id, config).Length == 0;
+                        string accountId = Accounts.ActiveId(config, id);
+                        Func<string, string, string, string, int, Task<object>> post = StepFunPost;
+                        // 刷新请求的 host 与 oasis-appid 必须同站（跨站带有效 token 会被平台判
+                        // 盗用烧 token）：两侧都从同一生效 appid（token 自带优先、提取不到按区域
+                        // 回退）派生，天然一致。
+                        // 写回失败可观测：SetProviderKey 写失败回 false（不抛异常），只记一条
+                        // 日志（context 固定文案，绝不带 token 本体）——否则"刷新只在内存生效、
+                        // 下次还拿旧 token"完全静默，用户与排障都看不到。
+                        Action<string> persist = null;
+                        if (persistable) persist = fresh => {
+                            try { if (!Store.SetProviderKey(id, accountId, fresh)) ErrorLog.Append("stepfun-keychain-writeback", new InvalidOperationException("Oasis-Token 刷新结果写回钥匙串失败，本次刷新仅在内存生效")); }
+                            catch (Exception e) { ErrorLog.Append("stepfun-keychain-writeback", e); }
+                        };
+                        Func<string, bool, Task<string>> roll = (current, force) => {
+                            // token 提取不到 app_id 时站点不确定：区域回退的 appid 可能打错站
+                            //（平台判盗用烧 token），非 force 的预刷新直接跳过返回 current——
+                            // 等 StepFunChannel 校准 region 后，靠 401/expired 兜底路径刷新。
+                            // force 路径不变（兜底刷新必须能救回被判过期的会话）。
+                            if (!force && Parsers.StepFunTokenAppId(current).Length == 0) return Task.FromResult(current);
+                            return StepFunAuth.EnsureFreshAsync(current, Parsers.StepFunWebId(current), Parsers.StepFunAppId(current, config.StepfunRegion), Parsers.StepFunHostForAppId(Parsers.StepFunAppId(current, config.StepfunRegion)), force, post, persist);
+                        };
+                        try { token = await roll(token, false).ConfigureAwait(false); }
+                        catch (ProviderException e) { if (e.State == "expired") throw; }
+                        try {
+                            s = await StepFunChannel(token, config.StepfunRegion, post, region => {
+                                config.StepfunRegion = region;
+                                // 与 Connect 的区域切换同款持久化：写失败不拖垮本次已到手的读数。
+                                try { Store.Write("settings.json", config); } catch { }
+                            }).ConfigureAwait(false);
+                        } catch (ProviderException e) when (e.State == "expired") {
+                            token = await roll(token, true).ConfigureAwait(false);   // 判死在 roll 内抛 expired
+                            s = await StepFunChannel(token, config.StepfunRegion, post, region => {
+                                config.StepfunRegion = region;
+                                try { Store.Write("settings.json", config); } catch { }
+                            }).ConfigureAwait(false);
+                        }
                         break;
                     }
                     default: {
@@ -1080,7 +1145,7 @@ namespace CodeUsageMonit {
         // ── 云端额度通道（MiMo Console Cookie / StepFun Oasis-Token）────────
         // 这些端点只为官方 Web 控制台服务，凭据随浏览器会话走：请求带桌面浏览器 UA、
         // 显式 Cookie/Origin/Referer 头，host 锁死在官方域名白名单内。
-        private const string DesktopUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+        internal const string DesktopUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
         // MiMo：全部 GET {base}/api/v1/<path>，Cookie 即归一化后的 Console Cookie。
         private Task<object> MiMoGet(string path, string cookie, int timeoutSeconds = 18) {
             var headers = new Dictionary<string, string> {
@@ -1090,6 +1155,88 @@ namespace CodeUsageMonit {
                 { "Referer", "https://platform.xiaomimimo.com/#/console/balance" }
             };
             return CloudRequest("https://platform.xiaomimimo.com/api/v1" + path, new[] { "platform.xiaomimimo.com" }, null, headers, Parsers.MimoExpiredMessage, timeoutSeconds);
+        }
+        // MiMo 桌面客户端自动续期（候选逐组换票）：旧实现只读第一个存在的候选，而旧版
+        // 分区（"Xiaomi MiMo AI"）恰在候选列表首位——升级用户该路径残留、passToken 已
+        // 失效时，自动续期永远打不中现行分区。现在对每个存在的候选分别读库 + 换票：
+        // 任一失败结局（拒登 / 限流 / 不可用）都继续下一个——候选至多两个、15 秒总时限
+        // 封顶，瞬时失败不值得为它放弃另一条可能有效的候选；任一候选成功即返回它的
+        // Console Cookie；全部失败返回 null（调用方回退手动 Cookie）。15 秒总时限由调用方的
+        // deadline 覆盖整个循环。transport 缝注入真实 HTTP（MimoExchangeHop），自测传
+        // 合成链；ReadAccount 的单库解析逻辑不变（含 0600 副本与用完即删）。
+        internal static async Task<string> MimoDesktopCookie(string[] candidates, Func<MimoExchange.Hop, System.Threading.CancellationToken, Task<MimoExchange.Reply>> transport, System.Threading.CancellationToken deadline) {
+            bool minted = false; MimoExchange.Outcome last = MimoExchange.Outcome.Unavailable;
+            MimoDesktop.ReadReason lastRead = MimoDesktop.ReadReason.StoreAbsent;
+            foreach (string store in candidates ?? Array.Empty<string>()) {
+                MimoDesktop.ReadResult account = MimoDesktop.ReadAccount(new[] { store });
+                // 不存在（StoreAbsent，客户端未装）/ 读不了 / 加密存储 / 未登录：换下一个。
+                // StoreAbsent 以外的读取失败都记下来——客户端已装却因加密存储或未登录静默
+                // 回退是最难排障的形态（循环结束后统一去重落一条，见下方）。
+                if (account.Reason != MimoDesktop.ReadReason.Ok) { if (account.Reason != MimoDesktop.ReadReason.StoreAbsent) lastRead = account.Reason; continue; }
+                minted = true;
+                MimoExchange.Result fresh = await MimoExchange.Mint(MimoDesktop.SeedHeader(account.Cookie), MimoExchange.ConsoleEntry(), hop => transport(hop, deadline), null, deadline).ConfigureAwait(false);
+                if (fresh.Outcome == MimoExchange.Outcome.Ok && fresh.CookieHeader.Length > 0) { NoteMimoMint(null); return fresh.CookieHeader; }
+                // Ok 但 Cookie 头为空（会话 Cookie 全部过期/被白名单丢弃的罕见形态）按
+                // Unavailable 归类，否则诊断文案会自相矛盾地出现"换票结局 Ok"。
+                last = fresh.Outcome == MimoExchange.Outcome.Ok ? MimoExchange.Outcome.Unavailable : fresh.Outcome;
+            }
+            if (minted) NoteMimoMint("换票结局 " + last);   // 有候选读出来了但换票没成：记一条诊断（去重后）
+            else if (lastRead != MimoDesktop.ReadReason.StoreAbsent) NoteMimoMint("凭据读取结局 " + lastRead);
+            return null;
+        }
+        // 换票失败可观测：候选读出来但 Mint 没成功、或客户端已装但凭据读不出时，旧实现
+        // 整段 catch{} 完全静默——用户只看到"回退手动 Cookie 后 expired"，排障没有任何
+        // 线索。现在经 SourceHealth.RecordError 记一条（内存 LastError 进健康摘要；
+        // Desktop 再把 ErrorSink 挂成 MonitorPanel.LogError 落 errors.log）。Fetch 每分钟
+        // 一次，每次都追加会刷屏，因此按「结局变化才记」去重：静态记录上次已记的结局，
+        // 相同结局不再重复落盘（LastError 保留首次记录、时间戳随之变旧，换取日志不刷屏）；
+        // 成功即清零，下次失败算新的变化。文案只带枚举结局，绝不带 passToken /
+        // serviceToken 等凭据值。detail = null 表示成功（只清零）。gate 防并发 Fetch 下
+        // check-then-act 重复落一行。
+        private static string mimoMintLogged;
+        private static readonly object mimoMintGate = new object();
+        private static void NoteMimoMint(string detail) {
+            lock (mimoMintGate) {
+                if (mimoMintLogged == detail) return;
+                mimoMintLogged = detail;
+                if (detail == null) return;   // 成功：只清零，不记
+                SourceHealth.RecordError("mimo", new InvalidOperationException("MiMo 桌面客户端自动续期失败（" + detail + "），本次回退手动 Console Cookie"));
+            }
+        }
+        // MiMo 桌面客户端换票的逐跳传输：复用本服务的 HttpClient（已禁自动重定向、走同一代理、
+        // UseCookies=false 保 Set-Cookie 原样可见），逐跳做内网地址守卫；总时限由 deadline 控制。
+        private async Task<MimoExchange.Reply> MimoExchangeHop(MimoExchange.Hop hop, System.Threading.CancellationToken deadline) {
+            await GuardPrivateAddress(hop.Url).ConfigureAwait(false);
+            using (var request = new HttpRequestMessage(HttpMethod.Get, hop.Url)) {
+                if (hop.Headers != null) foreach (var h in hop.Headers) request.Headers.TryAddWithoutValidation(h.Key, h.Value);
+                using (HttpResponseMessage response = await client.SendAsync(request, deadline).ConfigureAwait(false)) {
+                    var reply = new MimoExchange.Reply { Status = (int)response.StatusCode, Location = response.Headers.Location == null ? "" : response.Headers.Location.ToString() };
+                    foreach (string value in response.Headers.TryGetValues("Set-Cookie", out IEnumerable<string> lines) && lines != null ? lines : Enumerable.Empty<string>()) reply.SetCookie.Add(value);
+                    reply.Body = await ReadCappedAsync(response.Content, MimoExchangeBodyLimit).ConfigureAwait(false);
+                    return reply;
+                }
+            }
+        }
+        // 换票链响应体上限：对齐 NativeCredentials 的 4MB 单元格口径。SSO 链上的页面
+        // 可能返回任意大的 HTML，ReadAsStringAsync 不限量会把整段灌进内存；超出即截断，
+        // 换票判定只需要 401 body 的 loginUrl 与 console 的 code 字段（都在 JSON 开头），
+        // 截断不影响分类。internal 供自测直接喂合成内容（MimoExchangeHop 走真实 HTTP，
+        // 不自测）。
+        private const int MimoExchangeBodyLimit = 4 * 1024 * 1024;
+        internal static async Task<string> ReadCappedAsync(HttpContent content, int maxBytes) {
+            using (Stream stream = await content.ReadAsStreamAsync().ConfigureAwait(false)) {
+                // 租 80KB 池化分块按需攒，小 body（换票链的常见形态）不再固定吃 4MB LOH 分配；
+                // 只有真到大 body 时 MemoryStream 才按倍增长到上限。
+                var gathered = new MemoryStream();
+                byte[] chunk = System.Buffers.ArrayPool<byte>.Shared.Rent(80 * 1024);
+                try {
+                    int read;
+                    while (gathered.Length < maxBytes && (read = await stream.ReadAsync(chunk, 0, (int)Math.Min(chunk.Length, maxBytes - gathered.Length)).ConfigureAwait(false)) > 0) gathered.Write(chunk, 0, read);
+                    return Encoding.UTF8.GetString(gathered.GetBuffer(), 0, (int)gathered.Length);
+                } finally {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(chunk);
+                }
+            }
         }
         // StepFun：固定 POST 空 JSON 体，Oasis-Token 同时放在专用 Cookie 与 oasis-* 头里。
         // appid 必须与 token 所属应用一致（由 Parsers.StepFunAppId 从 token 提取）；
@@ -1109,15 +1256,26 @@ namespace CodeUsageMonit {
             return CloudRequest(url, new[] { "platform.stepfun.ai", "platform.stepfun.com" }, "{}", headers, Parsers.StepFunExpiredMessage, timeoutSeconds);
         }
         // StepFun 通道主体（post 注入真实 HTTP 供自测替换；persistRegion 写回回退后的区域）。
-        // expired 先视为区域错配而非凭据失效：同一 token 在另一站可能仍然有效，自动换区域
-        // 完整重试一次（两个端点、appid 按新区域重算——回退值随站点不同）。回退成功才写回
-        // 区域，后续刷新直接用对的站点；两站都 expired 抛最后一次（真过期与双重错配对用户
-        // 的处理动作相同）。非 expired 失败立即上抛，不做无意义的跨站重试。
+        // 站点选择：token 各段 JWT 里能提取到 app_id 时站点由它决定（20700→.ai、10300→.com，
+        // 见 StepFunHostForAppId），且不做跨站重试——平台对"appid 与站点不配"的有效 token 判
+        // 盗用并烧 token，锁站是保护；只有 appid 提取失败（垃圾 token、靠区域回退）时才维持
+        // 旧行为：按配置区域起手，expired 视为区域错配自动换另一站完整重试一次（appid 按
+        // 新区域重算）。回退成功才写回区域，后续刷新直接用对的站点；两站都 expired 抛最后一
+        // 次（真过期与双重错配对用户的处理动作相同）。非 expired 失败立即上抛，不做无意义的
+        // 跨站重试。
         internal static async Task<ProviderState> StepFunChannel(string token, string region, Func<string, string, string, string, int, Task<object>> post, Action<string> persistRegion) {
             string webid = Parsers.StepFunWebId(token);
+            string tokenAppId = Parsers.StepFunTokenAppId(token);
+            // 每个候选站 = { host, appid }。锁站时只有一个候选；区域回退时按配置区域起手。
+            string[][] sites = tokenAppId.Length > 0
+                ? new[] { new[] { Parsers.StepFunHostForAppId(tokenAppId), tokenAppId } }
+                : new[] {
+                    new[] { Parsers.StepFunHost(region), Parsers.StepFunAppId(token, region) },
+                    new[] { Parsers.StepFunHost(region == "china" ? "global" : "china"), Parsers.StepFunAppId(token, region == "china" ? "global" : "china") }
+                };
             ProviderException expired = null;
-            foreach (string current in new[] { region, region == "china" ? "global" : "china" }) {
-                string host = Parsers.StepFunHost(current), appid = Parsers.StepFunAppId(token, current);
+            foreach (string[] site in sites) {
+                string host = site[0], appid = site[1];
                 try {
                     ProviderState s = Parsers.StepFun(await post(host + "/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit", token, webid, appid, 18).ConfigureAwait(false));
                     // 主请求成功即证明凭据有效：套餐名是次要数据，任何失败（含 expired——
@@ -1126,7 +1284,7 @@ namespace CodeUsageMonit {
                         string plan = Parsers.StepFunPlan(await post(host + "/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus", token, webid, appid, 6).ConfigureAwait(false));
                         if (plan.Length > 0) s.Plan = plan;
                     } catch (Exception) { }
-                    if (current != region && persistRegion != null) persistRegion(current);
+                    if (tokenAppId.Length == 0 && host != Parsers.StepFunHost(region) && persistRegion != null) persistRegion(region == "china" ? "global" : "china");
                     return s;
                 } catch (ProviderException e) when (e.State == "expired") { expired = e; }
             }
@@ -1174,8 +1332,9 @@ namespace CodeUsageMonit {
             return uri;
         }
         // hosts 劫持把官方域名解析到环回/内网地址时拒绝连接（尽力而为：解析失败不拦截，
-        // 交给请求自身的网络错误路径——经代理的场景本地可能不解析）。
-        private static async Task GuardPrivateAddress(Uri uri) {
+        // 交给请求自身的网络错误路径——经代理的场景本地可能不解析）。internal 供 MiMo
+        // 桌面客户端换票的逐跳传输复用。
+        internal static async Task GuardPrivateAddress(Uri uri) {
             IPAddress[] addresses;
             try { addresses = await Dns.GetHostAddressesAsync(uri.Host).ConfigureAwait(false); } catch { return; }
             if (addresses.Any(IsPrivateAddress)) throw new ProviderException(uri.Host + " 解析到了内网地址，已拒绝连接", "error");

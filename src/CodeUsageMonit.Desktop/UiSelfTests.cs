@@ -27,6 +27,7 @@ namespace CodeUsageMonit {
             yield return new KeyValuePair<string, Action>("Desktop: the headless accounts page builds six enabled key boxes with placeholders and a detected-accounts row per platform", AccountsPageCheck);
             yield return new KeyValuePair<string, Action>("Desktop: credential panels build one collapsible panel per provider with status pills, default-open, toggle and per-kind bodies", PanelsStructureCheck);
             yield return new KeyValuePair<string, Action>("Desktop: the data page builds a null-safe WebDAV password box so save never dereferences null (regression: settings save NRE)", DataPagePasswordCheck);
+            yield return new KeyValuePair<string, Action>("Desktop: the settings window builds with a null Enabled set and normalises it at the entry (regression: settings build NRE)", SettingsEnabledNullCheck);
             yield return new KeyValuePair<string, Action>("Desktop: Urgent orders overview providers by quota availability and filters nothing", UrgentOrderCheck);
             // D 期四项（hero 三档 / 构成细分 / 趋势卡 / 账户遮罩）：
             yield return new KeyValuePair<string, Action>("Desktop: hero range presets resolve this month and the 370-day horizon with their labels", RangePresetCheck);
@@ -54,6 +55,28 @@ namespace CodeUsageMonit {
             if (renderInterfaceReady) return;
             Avalonia.Skia.SkiaPlatform.Initialize();
             renderInterfaceReady = true;
+        }
+        // 无头环境没有平台光标工厂：MiniSlider 构造时 new Cursor(StandardCursorType.Hand)
+        // 要解析 ICursorFactory（SkiaPlatform.Initialize 只注册渲染接口）。两个坑：
+        // 引用程序集把 AvaloniaLocator 的 CurrentMutable/Bind 藏成 internal（编译期
+        // 不可见、运行期是 public），ICursorFactory 又带 [PrivateApi]（用户代码不得
+        // 实现）——因此走反射绑定 + DispatchProxy 生成桩。无指针事件的自测环境里
+        // GetCursor 不会被调用，桩返回 null 即可。
+        private class CursorFactoryProxy : System.Reflection.DispatchProxy {
+            public CursorFactoryProxy() { }
+            protected override object Invoke(MethodInfo targetMethod, object[] args) { return null; }
+        }
+        private static bool cursorFactoryReady;
+        private static void EnsureCursorFactory() {
+            if (cursorFactoryReady) return;
+            Type locator = typeof(Avalonia.AvaloniaLocator);
+            object mutable = locator.GetProperty("CurrentMutable", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+            MethodInfo bind = locator.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).First(m => m.Name == "Bind" && m.IsGenericMethodDefinition);
+            object helper = bind.MakeGenericMethod(typeof(Avalonia.Platform.ICursorFactory)).Invoke(mutable, null);
+            MethodInfo toConstant = helper.GetType().GetMethods().First(m => m.Name == "ToConstant" && m.IsGenericMethodDefinition);
+            object proxy = System.Reflection.DispatchProxy.Create<Avalonia.Platform.ICursorFactory, CursorFactoryProxy>();
+            toConstant.MakeGenericMethod(typeof(Avalonia.Platform.ICursorFactory)).Invoke(helper, new[] { proxy });
+            cursorFactoryReady = true;
         }
 
         // ── 认证页（需求3）：四个密钥平台 KeyBox 存在、可用、带占位符；检测区每平台一行 ──
@@ -241,6 +264,54 @@ namespace CodeUsageMonit {
                 Require(MonitorPanel.BoxText(new TextBox { Text = " abc " }) == " abc ", "BoxText must pass text through verbatim");
             } finally {
                 Keychain.RunOverride = null;   // 约定：自测缝用毕归 null（生产代码恒为 null）
+                Store.SwapData(previousData);
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        // ── 设置窗口 Enabled 空值回归：构建期不再 NRE，且归位结果对保存路径可见 ──
+        // settings.json 里 "Enabled": null 曾在 BuildSettings 构建期的
+        // config.Enabled.Contains(id) 直接抛 NullReferenceException（errors.log
+        // 2026-10-09），防御此前后只在保存回调里、窗口根本打不开。现归位到构建入口
+        // （首次使用 config.Enabled 之前），保存回调不再重复防御。
+        private static void SettingsEnabledNullCheck() {
+            string dir = Path.Combine(Path.GetTempPath(), "cum-ui-enabled-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            string previousData = Store.SwapData(dir);
+            Keychain.RunOverride = args => null;   // 隔离：绝不触碰真实钥匙串
+            try {
+                // 图标 / 棋盘格 / 折叠头 chevron 走几何解析，需要已注册的渲染接口；
+                // MiniSlider 的光标需要 stub 光标工厂（无头环境没有平台实现）。
+                EnsureRenderInterface();
+                EnsureCursorFactory();
+                // 服务状态卡：缓存缺失即过期，会触发后台联网刷新——预置一份新鲜缓存，
+                // 保证自测期间不发起网络请求（与 UiSelfTests 的隔离约定一致）。
+                var fresh = new ServiceStatus.Cache { Updated = DateTime.UtcNow.ToString("o") };
+                fresh.Readings.Add(new ServiceStatus.Reading { Id = "claude", Name = "Claude", Page = "https://status.claude.com", Indicator = "none", Description = "All Systems Operational", Checked = DateTime.UtcNow.ToString("o"), Ok = true });
+                Store.Write("service-status.json", fresh);
+                var config = new AppConfig { Enabled = null };   // 损坏配置的形态
+                var panel = Bare(config, ProviderCatalog.All.ToDictionary(id => id, id => new ProviderState { Id = id }));
+                Set(panel, "settingsTab", "general");   // 字段初始化器不经 GetUninitializedObject 运行
+                Set(panel, "updateState", new UpdateState());   // 关于页读取该字段（未初始化实例上是 null）
+                Control view = null;
+                try { view = (Control)typeof(MonitorPanel).GetMethod("BuildSettings", Hidden).Invoke(panel, null); }
+                catch (TargetInvocationException e) { throw e.InnerException ?? e; }   // 报告里要真实异常而不是反射包装
+                Require(view != null, "BuildSettings returned nothing");
+                // 归位发生在构建入口：保存回调与其余使用点看到的都是默认集合。
+                Require(config.Enabled != null && config.Enabled.SequenceEqual(ProviderCatalog.DefaultEnabled), "Enabled must be normalised to the default set at the build entry");
+                // 通用页的平台 chips 按归位后的集合勾选（修复前构建期就 NRE，走不到断言）。
+                // chips 挂在 ScrollViewer 的 Content 下：无窗口宿主时模板不实例化，可视化树
+                // 拿不到 Content，必须沿逻辑树找（同窄条 edge 检查的做法）。
+                var chipNames = new HashSet<string>(ProviderCatalog.All.Select(ProviderCatalog.Name));
+                var chips = LogicalFind<CheckBox>(view).Where(c => chipNames.Contains(AutomationProperties.GetName(c) ?? "")).ToList();
+                Require(chips.Count == ProviderCatalog.All.Count(), "one chip per provider, got " + chips.Count);
+                foreach (string id in ProviderCatalog.All) {
+                    CheckBox chip = chips.First(c => AutomationProperties.GetName(c) == ProviderCatalog.Name(id));
+                    Require((chip.IsChecked == true) == ProviderCatalog.DefaultEnabled.Contains(id), id + " chip must follow the normalised set");
+                }
+                Require(Store.Data == dir, "Store.Data not isolated to the temporary directory");
+            } finally {
+                Keychain.RunOverride = null;
                 Store.SwapData(previousData);
                 try { Directory.Delete(dir, true); } catch { }
             }

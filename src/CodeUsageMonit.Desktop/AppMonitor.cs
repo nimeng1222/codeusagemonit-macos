@@ -80,7 +80,7 @@ namespace CodeUsageMonit {
             Accounts.Normalize(config);   // Phase 5：容错修复账户结构（对旧配置是空操作）
             WindowFrame.Normalize(config);
             config.RefreshMinutes = Math.Max(1, Math.Min(60, config.RefreshMinutes));
-            if (config.Enabled == null || config.Enabled.Length == 0) config.Enabled = ProviderCatalog.DefaultEnabled;
+            if (config.Enabled == null || config.Enabled.Length == 0) config.Enabled = (string[])ProviderCatalog.DefaultEnabled.Clone();
             if (!demo) RegisterCustomProviders(CustomProviders.Load());
             window = new MainWindow();
             compactRoot = Named<Border>(window, "CompactRoot");

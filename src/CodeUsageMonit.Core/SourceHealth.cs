@@ -56,8 +56,11 @@ namespace CodeUsageMonit {
         // 与 CLI 的 providers 说明（CliProgram.Credential）同一批本机位置；这里只做布尔
         // 判断，供五态里的 unconfigured 使用。
         public static bool HasCredential(string id, AppConfig config) {
+            return HasCredential(id, config, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        }
+        // home 可注入的重载：供自测用假 home 构造候选文件（默认行为不变）。
+        internal static bool HasCredential(string id, AppConfig config, string home) {
             if (ProviderCatalog.LocalOnly(id)) return true;   // pi：只统计本机日志，无需凭据
-            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             // Phase 5：Key 型平台按活动账户判断（缺省 = 默认账户，行为不变）。
             string active = Accounts.ActiveId(config, id);
             switch (id) {
@@ -81,6 +84,10 @@ namespace CodeUsageMonit {
                     // LocalCliCredentials 同源。
                     if (id == "kimi") return File.Exists(LocalCliCredentials.KimiConfigPath) || File.Exists(LocalCliCredentials.KimiCredentialsPath);
                     if (id == "zcode") return File.Exists(LocalCliCredentials.ZCodeCredentialsPath);
+                    // MiMo 桌面客户端已登录即算已配置（自动续期链路读的就是这份 Cookies
+                    // 库）。同 kimi/zcode 口径：只看候选文件存在、绝不读取内容；其他平台
+                    // 没有客户端，StoreCandidates 返回空即 false。
+                    if (id == "mimo") return MimoDesktop.StoreCandidates(home).Any(path => File.Exists(path));
                     return false;
             }
         }

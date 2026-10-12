@@ -1726,7 +1726,10 @@ namespace CodeUsageMonit {
                 string previous = Store.SwapData(dir);
                 bool enabled = UsageArchive.Enabled; UsageArchive.Enabled = true;
                 try {
-                    DateTime now = DateTime.UtcNow;
+                    // 固定 now（此前用 DateTime.UtcNow，测试对日期敏感：now-40d 与 now-41d 落进
+                    // 不同月份时文件数变成 3，2026-10-11 起必然失败）。now=09-15 → -1h 在 09 月、
+                    // -40d 与 -41d 都在 08 月，与断言的"两个文件"严格对应。
+                    DateTime now = new DateTime(2026, 9, 15, 12, 0, 0, DateTimeKind.Utc);
                     var index = new LogIndex();
                     index.Files.Add(new LogFile { Name = "a.jsonl", Hours = {
                         { LogIndex.BucketKey(now.AddHours(-1), "openai", "m"), new Bucket { I = 100, O = 10, R = 1, D = .5 } },
@@ -1734,7 +1737,7 @@ namespace CodeUsageMonit {
                     index.Expiring[LogIndex.BucketKey(now.AddDays(-41), "relay", "m2")] = new Bucket { I = 3, R = 1 };
                     index.Expiring[LogIndex.BucketKey(now.AddDays(-400), "old", "m3")] = new Bucket { I = 9, R = 1 };   // 超出归档视野：永不落盘
                     Require(UsageArchive.Append(index, "codex", now) == 3);
-                    // 按桶的 UTC 月份分文件：当月桶与 8 月的过期桶分属两个文件，共 3 行。
+                    // 按桶的 UTC 月份分文件：09 月的当月桶与 08 月的过期桶分属两个文件，共 3 行。
                     string[] files = Directory.GetFiles(UsageArchive.Folder(), "usage-*.jsonl", SearchOption.AllDirectories);
                     Require(files.Length == 2);
                     Func<string[]> allLines = () => files.SelectMany(f => File.ReadAllLines(f)).ToArray();

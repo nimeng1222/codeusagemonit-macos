@@ -33,6 +33,10 @@ C# / .NET 8 / Avalonia（原生 macOS 应用，非 Electron）。凭据存放在
 - 首次运行 `codeusagemonit --demo` 可看演示数据；`codeusage --self-test` 与 `codeusagemonit --self-test` 运行内置自检。
 - 数据目录：`~/Library/Application Support/codeusagemonit`（GUI 与 CLI 共用；exe 旁放 `portable.txt` 可强制便携模式）。
 
+## 注意：StepFun 凭据的并发刷新
+
+StepFun 的 Oasis-Token 临近过期时会自动滚动刷新，新凭据写回钥匙串。写回前的去重是进程内的：CLI 与桌面端同时刷新同一个 StepFun 账户时存在一个并发窗口——两边各自刷新、后写者胜出，落后的一次查询可能用到刚被顶替的旧凭据，下一次刷新即自愈。因此建议避免同时用 CLI 和桌面端查询 StepFun。
+
 ## 构建
 
 ```sh

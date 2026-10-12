@@ -38,7 +38,7 @@ namespace CodeUsageMonit {
             }
             string command = rest.Count > 0 ? rest[0] : "status";
             var config = Store.Read<AppConfig>("settings.json");
-            if (config.Enabled == null || config.Enabled.Length == 0) config.Enabled = ProviderCatalog.DefaultEnabled;
+            if (config.Enabled == null || config.Enabled.Length == 0) config.Enabled = (string[])ProviderCatalog.DefaultEnabled.Clone();
             Accounts.Normalize(config);   // Phase 5：容错修复账户结构（对旧配置是空操作）
             foreach (CustomProvider custom in CustomProviders.Load()) ProviderCatalog.Custom[custom.Id] = custom;
             foreach (string id in only) if (!ProviderCatalog.IsKnown(id)) return Fail("未知平台：" + id + "（codeusage providers 查看全部）");

@@ -133,6 +133,11 @@ namespace CodeUsageMonit {
         private string settingsTab = "general";
         private static readonly string[][] SettingsTabs = { new[] { "general", "通用" }, new[] { "accounts", "认证" }, new[] { "data", "数据" }, new[] { "advanced", "高级" }, new[] { "about", "关于" } };
         private Control BuildSettings() {
+            // Enabled 空值防御：settings.json 里 "Enabled": null 会让构建期的
+            // config.Enabled.Contains(id)（errors.log 2026-10-09 的 NullReferenceException）
+            // 直接崩掉设置窗口。归位到构建入口（首次使用 config.Enabled 之前），保存
+            // 回调经本入口打开窗口时看到的一定是归位后的集合，无需重复防御。
+            if (config.Enabled == null) config.Enabled = (string[])ProviderCatalog.DefaultEnabled.Clone();
             var root = new Grid();
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); root.RowDefinitions.Add(new RowDefinition()); root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             var pages = SettingsTabs.ToDictionary(t => t[0], t => new StackPanel());
